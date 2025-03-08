@@ -32,6 +32,7 @@ source venv/bin/activate
 :: Install Python dependencies
 echo Installing Python packages...
 pip install aiohttp aiolimiter bip-utils 
+pip install -r requirement.txt
 
 :: Install Go dependencies
 echo Installing Go packages...
