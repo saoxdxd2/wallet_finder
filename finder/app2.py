@@ -78,6 +78,8 @@ class WalletGUI(tk.Tk):
         super().__init__()
         self.title("Crypto Wallet Scanner")
         self.geometry("1400x900")
+        self.last_inode = None
+        self.file_version = 0
         
         # UI setup
         main_frame = ttk.PanedWindow(self, orient=tk.VERTICAL)
@@ -147,15 +149,31 @@ class WalletGUI(tk.Tk):
     def update_checked(self):
         try:
             if os.path.exists('checked.txt'):
+            # Get current file stats
+                current_stat = os.stat('checked.txt')
+                current_inode = current_stat.st_ino
+                current_size = current_stat.st_size
+
+            # Reset position if file has been rotated
+                if hasattr(self, 'last_inode'):
+                    if current_inode != self.last_inode or current_size < self.last_pos:
+                        self.last_pos = 0
+                    
+                self.last_inode = current_inode
+            
                 with open('checked.txt', 'r') as f:
+                # Reset position if file is smaller than last position
+                    if current_size < self.last_pos:
+                        self.last_pos = 0
+                
                     f.seek(self.last_pos)
                     new_lines = f.readlines()
                     self.last_pos = f.tell()
-                
-                for line in new_lines:
-                    if line.strip() and line not in self.seen_entries:
-                        self.process_entry(line)
-                        self.seen_entries.add(line)
+
+                    for line in new_lines:
+                        if line.strip() and line not in self.seen_entries:
+                            self.process_entry(line)
+                            self.seen_entries.add(line)
         except Exception as e:
             pass
         finally:
