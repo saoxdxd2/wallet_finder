@@ -10,7 +10,7 @@ if %errorlevel% neq 0 (
 
 :: Install Go and Python
 echo Installing Go and Python...
-choco install -y golang python
+choco install -y golang python rust
 
 :: Refresh environment variables
 call refreshenv
