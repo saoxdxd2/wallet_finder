@@ -30,9 +30,10 @@ A cross-platform tool for generating and checking cryptocurrency wallet balances
 ## Installation
 
 ### Windows
-1. Right-click `install_win.bat` and "Run as administrator"
-2. Follow on-screen prompts
-3. Application will launch automatically
+1. download install.bat from the project (outside the folder)
+2. Right-click `install.bat` and "Run as administrator"
+3. Follow on-screen prompts
+4. Application will launch automatically
 
 ### Linux
 ```bash
