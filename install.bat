@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: Check for administrator privileges
+:: Admin check
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting administrator privileges...
@@ -9,12 +9,12 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-:: Install Chocolatey if not present
+:: Install Chocolatey once
 where choco >nul 2>&1
 if %errorlevel% neq 0 (
     echo Installing Chocolatey...
     @powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))" || exit /b
-    set PATH=%PATH%;%ALLUSERSPROFILE%\chocolatey\bin
+    set "PATH=%PATH%;%ALLUSERSPROFILE%\chocolatey\bin"
 )
 
 :: Install Git
@@ -23,7 +23,7 @@ choco install -y git || (
     exit /b
 )
 
-:: Clone repository
+:: Clone repo
 if not exist "wallet_finder" (
     git clone https://github.com/saoxdxd2/wallet_finder.git || (
         echo Failed to clone repository!
@@ -31,12 +31,13 @@ if not exist "wallet_finder" (
     )
 )
 
-:: Navigate to directory and run installer
+:: Navigate to directory
 cd wallet_finder\finder || (
     echo Could not find finder directory!
     exit /b
 )
 
+:: Run installer
 call install_win.bat || (
     echo Failed to run installer!
     exit /b
