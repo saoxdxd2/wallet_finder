@@ -4,7 +4,8 @@ setlocal enabledelayedexpansion
 :: Install dependencies
 echo Installing Go, Python, Rust...
 choco install -y golang python rust
-choco install visualstudio2022-build-tools -y --params="--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+choco install microsoft-visual-cpp-build-tools
+choco install visualstudio2022buildtools -y --params="--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 
 :: Refresh environment
 call refreshenv
