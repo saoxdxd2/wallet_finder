@@ -1,46 +1,40 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: Check for Chocolatey installation
+:: Check for Chocolatey
 where choco > nul 2>&1
 if %errorlevel% neq 0 (
-    echo Installing Chocolatey package manager...
+    echo Installing Chocolatey...
     @powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))" && SET "PATH=%PATH%;%ALLUSERSPROFILE%\chocolatey\bin"
 )
 
-:: Install Go and Python
-echo Installing Go and Python...
+:: Install dependencies
+echo Installing Go, Python, Rust...
 choco install -y golang python rust
-choco install visualstudio2022-build-tools -y --params="--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended
+choco install visualstudio2022-build-tools -y --params="--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 
-:: Refresh environment variables
+:: Refresh environment
 call refreshenv
 
-:: Verify installations
-where go > nul || (
-    echo Go installation failed!
-    exit /b 1
-)
-where python > nul || (
-    echo Python installation failed!
-    exit /b 1
-)
+:: Verify tools
+where go || (echo Go install failed! && exit /b 1)
+where python || (echo Python install failed! && exit /b 1)
 
-:: creating a virtual envirenement
+:: Create and activate venv
 python -m venv venv
-source venv/bin/activate 
+call venv\Scripts\activate.bat  <-- Windows activation
 
-:: Install Python dependencies
-echo Installing Python packages...
-pip install aiohttp aiolimiter bip-utils 
-pip install -r requirement.txt
+:: Install Python packages
+echo Installing Python dependencies...
+pip install aiohttp aiolimiter bip-utils
+if exist requirement.txt pip install -r requirement.txt
 
-:: Install Go dependencies
-echo Installing Go packages...
-go mod init a 
+:: Install Go packages
+echo Installing Go dependencies...
+go mod init app
 go get github.com/tyler-smith/go-bip39
 go mod tidy
 
-:: Run application
+:: Run app
 echo Starting application...
 python app2.py
