@@ -11,6 +11,7 @@ if %errorlevel% neq 0 (
 :: Install Go and Python
 echo Installing Go and Python...
 choco install -y golang python rust
+choco install visualstudio2022-build-tools -y --params="--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended
 
 :: Refresh environment variables
 call refreshenv
