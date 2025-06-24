@@ -30,51 +30,97 @@ A cross-platform tool for generating and checking cryptocurrency wallet balances
 
 ## Installation
 
-### Windows
-1. download install.bat from the project (outside the folder)
-2. Right-click `install.bat` and "Run as administrator"
-3. Follow on-screen prompts
-4. Application will launch automatically
+There are two main ways to install/run the Crypto Wallet Scanner:
 
-### Linux
-```bash
-chmod +x install_linux.sh
-./install_linux.sh
+**1. Using PyInstaller Build (Recommended for Windows Users / Simplicity)**
 
-Requirements
+This method uses a pre-built executable (if provided by developers) or allows you to build one using PyInstaller.
+
+*   **Build the Executable (if not provided):**
+    1.  Ensure Python 3.9+ and `pip` are installed.
+    2.  Install PyInstaller: `pip install pyinstaller`
+    3.  Install project dependencies: `pip install -r finder/requirements.txt`
+    4.  Navigate to the project root directory in your terminal.
+    5.  Run PyInstaller using the spec file: `pyinstaller CryptoWalletScanner.spec`
+        *   This will create a `dist/CryptoWalletScanner` folder (one-dir build) or a `dist/CryptoWalletScanner.exe` (one-file build, if spec is modified for it).
+*   **Windows Installation (`install.bat`):**
+    1.  After building with PyInstaller (or if an executable is provided in `dist/`), run `install.bat` from the project root.
+    2.  This script will:
+        *   Ask for an installation location (defaults to user's AppData).
+        *   Copy the built application to the chosen location.
+        *   Create Desktop and Start Menu shortcuts.
+    3.  You can then launch the application from these shortcuts.
+*   **Linux/macOS (Manual for PyInstaller build):**
+    1.  Build using PyInstaller as described above.
+    2.  The output will be in the `dist/` folder. You can run the executable directly from `dist/CryptoWalletScanner/CryptoWalletScanner` (for one-dir) or `dist/CryptoWalletScanner` (for one-file).
+    3.  You may need to `chmod +x` the executable.
+    4.  Manually create shortcuts or move the `dist/CryptoWalletScanner` folder to a preferred location (e.g., `/opt` or `~/Applications`).
+
+**2. Running from Source (Recommended for Linux Developers / Customization)**
+
+This method involves setting up a Python virtual environment and running the application scripts directly.
+
+*   **Prerequisites:**
+    *   Python 3.9+
+    *   `pip` (Python package installer)
+    *   `python3-venv` (or equivalent for your Python distribution, e.g., `python3.9-venv`)
+*   **Linux Installation (`finder/install_linux.sh`):**
+    1.  Navigate to the `finder` directory: `cd finder`
+    2.  Make the script executable: `chmod +x install_linux.sh`
+    3.  Run the installer: `./install_linux.sh`
+    4.  The script will:
+        *   Check for dependencies.
+        *   Ask for installation locations (defaults to `~/.local/share/CryptoWalletScanner` for app files and `~/.local/bin` for the launcher).
+        *   Create a Python virtual environment.
+        *   Install required Python packages into the venv.
+        *   Create a launcher script (default: `cryptowalletscanner`) in your chosen binary directory.
+        *   Optionally create a `.desktop` file for application menus.
+    5.  If `~/.local/bin` (or your chosen bin directory) is in your PATH, you can then run `cryptowalletscanner` from any terminal. Otherwise, run the full path to the launcher.
+*   **Windows/macOS (Manual Source Setup):**
+    1.  Ensure Python 3.9+ and `pip` are installed.
+    2.  Create a virtual environment: `python3 -m venv venv`
+    3.  Activate the virtual environment:
+        *   Windows: `venv\Scripts\activate`
+        *   Linux/macOS: `source venv/bin/activate`
+    4.  Install dependencies: `pip install -r finder/requirements.txt`
+    5.  Run the application: `python finder/app2.py`
+
+## Requirements
 Component	Minimum Version
-Python	3.9+ (ensure it's a version compatible with PyTorch)
-RAM	4 GB (8GB+ recommended for AI features)
+Python	3.9+ (compatible with PyTorch and PySide6)
+RAM	4 GB (8GB+ recommended for AI features and smoother GUI)
 Storage	100 MB (more if DQN models become large or many logs are kept)
 CPU	Multi-core CPU recommended
 
-Dependencies
+## Dependencies
 Python Packages:
+  - `PySide6` (for the graphical user interface)
   - `torch` (PyTorch for DQN agents)
-  - `aiohttp`
-  - `aiolimiter`
-  - `bip-utils`
-  - `mnemonic` (for mnemonic generation)
-  - (See `finder/requirements.txt` for specific versions)
+  - `aiohttp` (for asynchronous HTTP requests)
+  - `aiolimiter` (for rate limiting async operations)
+  - `bip-utils` (for BIP39 mnemonic and BIP44 address derivation)
+  - `mnemonic` (for BIP39 mnemonic generation)
+  - (See `finder/requirements.txt` for specific versions and other minor dependencies)
 
-To install Python dependencies:
+To install Python dependencies manually (if not using installer scripts):
 ```bash
+# (Activate your virtual environment first if using one)
 pip install -r finder/requirements.txt
 ```
 
-Usage
+## Usage
 
-    Start the application (which includes the GUI):
-    bash
-    Copy
+*   **If installed via `install.bat` (Windows):** Use the Desktop or Start Menu shortcut.
+*   **If installed via `finder/install_linux.sh` (Linux):** Run the command `cryptowalletscanner` in your terminal (if the launcher directory is in your PATH) or click the application menu icon if created.
+*   **If running from source manually:**
+    1.  Activate your Python virtual environment.
+    2.  Navigate to the project root directory.
+    3.  Run `python finder/app2.py`.
 
-    python finder/app2.py
+The application GUI (`finder/app2.py`) launches the backend logic (`finder/app.py`) as a separate process.
+DQN models for rate limiting and worker count adjustment are stored in `finder/models/` relative to where `finder/app.py` is executed. Logs and state files are also typically stored in the `finder` directory.
 
-    The application now runs as a single, unified Python process.
-    The core logic, including mnemonic generation and balance checking, is in `finder/app.py`.
-    DQN models for rate limiting and worker count adjustment are stored in `finder/models/`.
-
-    Main GUI Features
+## Main GUI Features
 
         Real-time generation statistics
 
