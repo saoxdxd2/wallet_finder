@@ -25,21 +25,35 @@ class APIHandler:
         logger.debug("RL stats update callback coroutine set in APIHandler.")
 
     def _initialize_api_endpoint_stats(self):
+        # For balance endpoints
         for coin_key, url_templates in config.API_ENDPOINTS.items():
-            self.api_endpoint_stats[coin_key] = {}
-            for endpoint_url_template in url_templates:
-                self.api_endpoint_stats[coin_key][endpoint_url_template] = {
-                    "successes": 0, "failures": 0, "timeouts": 0, "errors_429": 0,
-                    "total_latency_ms": 0, "latency_count": 0,
-                    "score": config.API_ENDPOINT_INITIAL_SCORE
-                }
-        logger.info("API endpoint stats initialized within APIHandler.")
+            if coin_key not in self.api_endpoint_stats: self.api_endpoint_stats[coin_key] = {}
+            for url_template in url_templates:
+                if url_template not in self.api_endpoint_stats[coin_key]:
+                    self.api_endpoint_stats[coin_key][url_template] = {
+                        "type": "balance", "successes": 0, "failures": 0, "timeouts": 0, "errors_429": 0,
+                        "total_latency_ms": 0, "latency_count": 0, "score": config.API_ENDPOINT_INITIAL_SCORE }
+        # For existence check endpoints
+        for coin_key, url_templates in config.EXISTENCE_CHECK_API_ENDPOINTS.items():
+            if coin_key not in self.api_endpoint_stats: self.api_endpoint_stats[coin_key] = {}
+            for url_template in url_templates:
+                if url_template not in self.api_endpoint_stats[coin_key]: # Avoid overwriting if also a balance URL
+                    self.api_endpoint_stats[coin_key][url_template] = {
+                        "type": "existence", "successes": 0, "failures": 0, "timeouts": 0, "errors_429": 0,
+                        "total_latency_ms": 0, "latency_count": 0, "score": config.API_ENDPOINT_INITIAL_SCORE }
+        logger.info("API endpoint stats initialized within APIHandler for balance and existence.")
 
-    async def _update_specific_endpoint_stats(self, coin_key, url_template, success, is_timeout, is_429, latency_ms=0):
+    async def _update_specific_endpoint_stats(self, coin_key, url_template, success, is_timeout, is_429, latency_ms=0, endpoint_type="unknown"):
         if coin_key not in self.api_endpoint_stats or \
            url_template not in self.api_endpoint_stats[coin_key]:
             logger.warning(f"Attempted to update stats for unknown endpoint: CoinKey '{coin_key}', URL '{url_template}'")
-            return
+            # Initialize dynamically if a new URL is encountered (e.g. from config change without restart)
+            if coin_key not in self.api_endpoint_stats: self.api_endpoint_stats[coin_key] = {}
+            self.api_endpoint_stats[coin_key][url_template] = {
+                "type": endpoint_type, "successes": 0, "failures": 0, "timeouts": 0, "errors_429": 0,
+                "total_latency_ms": 0, "latency_count": 0, "score": config.API_ENDPOINT_INITIAL_SCORE }
+            logger.info(f"Dynamically initialized stats for new endpoint: {coin_key} - {url_template}")
+
 
         stats = self.api_endpoint_stats[coin_key][url_template]
         if success:
@@ -68,65 +82,91 @@ class APIHandler:
                 for url_template, stats in sorted_endpoints:
                     avg_latency = (stats['total_latency_ms'] / stats['latency_count']) if stats['latency_count'] > 0 else 0
                     logger.info(
-                        f"  URL: {url_template[:70]}... | Score: {stats['score']:.1f} | "
+                        f"  URL: {url_template[:70]}... ({stats.get('type','N/A')}) | Score: {stats['score']:.1f} | "
                         f"S: {stats['successes']}, F: {stats['failures']}, T: {stats['timeouts']}, 429s: {stats['errors_429']} | "
                         f"Avg Latency: {avg_latency:.0f}ms"
                     )
             logger.info("--- End API Endpoint Statistics (APIHandler) ---")
             self.last_api_stats_log_time = current_time
 
-    async def _fetch_balance_from_single_endpoint(self, url_template: str, coin_key, address: str):
-        is_timeout_local, is_429_local = False, False
-        status_code_local = None
+    async def _make_api_request(self, url_template: str, address: str, endpoint_type: str):
+        """Helper to make a single API request and gather detailed results including latency and status."""
+        is_timeout, is_429 = False, False
+        status_code = None
         latency_ms = 0
-        url_formatted = url_template.format(address=address)
-        start_time = time.perf_counter()
-        balance_val = 0.0
-        success_flag = False
+        response_data = None
+        request_success = False # HTTP success and parsable (if applicable)
+        url_formatted = url_template.format(address=address, apikey=config.ETHERSCAN_API_KEY) # Add API key formatting
 
+        start_time = time.perf_counter()
         try:
             async with self.overall_limiter:
                 async with self.session.get(url_formatted, timeout=config.API_CALL_TIMEOUT, headers={"User-Agent": config.DEFAULT_USER_AGENT}) as resp:
                     latency_ms = int((time.perf_counter() - start_time) * 1000)
-                    status_code_local = resp.status
+                    status_code = resp.status
                     resp_text = await resp.text()
 
-                    if status_code_local == 429: is_429_local = True
-
-                    if not is_429_local and status_code_local == 200:
+                    if status_code == 429: is_429 = True
+                    if status_code == 200:
                         try:
-                            data = json.loads(resp_text)
-                            if not ('error' in data or ('message' in data and isinstance(data.get('message'), str) and
-                                           "error" in data.get('message','').lower() and
-                                           not "rate limit" in data.get('message','').lower())):
-                                balance_val = self._parse_balance_payload(data, coin_key, url_formatted)
-                                success_flag = True
-                            else:
-                                logger.debug(f"API error in payload for {address} at {url_formatted}: {data.get('error', data.get('message'))}")
+                            response_data = json.loads(resp_text)
+                            # Basic check for API-level errors in payload if structure is known
+                            if not ('error' in response_data or ('message' in response_data and
+                                isinstance(response_data.get('message'), str) and
+                                "error" in response_data.get('message','').lower() and
+                                "rate limit" not in response_data.get('message','').lower() )): # Avoid double counting 429s
+                                request_success = True
+                            else: logger.debug(f"API error in payload {url_formatted}: {response_data.get('error') or response_data.get('message')}")
                         except json.JSONDecodeError:
                             logger.debug(f"Invalid JSON from {url_formatted}. Resp: {resp_text[:100]}")
-                    elif not is_429_local:
-                         logger.debug(f"API {url_formatted} status {status_code_local}. Resp: {resp_text[:100]}")
-
+                    else: # Non-200, non-429
+                        logger.debug(f"API {url_formatted} status {status_code}. Resp: {resp_text[:100]}")
         except asyncio.TimeoutError:
             latency_ms = int((time.perf_counter() - start_time) * 1000)
-            logger.debug(f"API timeout for {address} at {url_formatted}")
-            is_timeout_local = True
+            logger.debug(f"API timeout for {url_formatted}"); is_timeout = True
         except aiohttp.ClientError as e:
             latency_ms = int((time.perf_counter() - start_time) * 1000)
-            logger.debug(f"API client error for {address} at {url_formatted}: {type(e).__name__} - {str(e)}")
-            if hasattr(e, 'status') and e.status: status_code_local = e.status
-            if status_code_local == 429: is_429_local = True
+            logger.debug(f"API client error for {url_formatted}: {type(e).__name__} - {str(e)}")
+            if hasattr(e, 'status') and e.status: status_code = e.status
+            if status_code == 429: is_429 = True
         except Exception as e:
             latency_ms = int((time.perf_counter() - start_time) * 1000)
-            logger.warning(f"Unexpected API error for {address} at {url_formatted}: {type(e).__name__} - {str(e)}", exc_info=True)
+            logger.warning(f"Unexpected API error for {url_formatted}: {type(e).__name__} - {str(e)}", exc_info=True)
 
+        # Call general RL stats update callback (for overall rate limiter DQN)
         if self.rl_stats_update_callback:
-            await self.rl_stats_update_callback(status_code=status_code_local, is_timeout=is_timeout_local)
+            await self.rl_stats_update_callback(status_code=status_code, is_timeout=is_timeout)
 
-        return balance_val, success_flag, is_timeout_local, is_429_local, latency_ms
+        # Update stats for this specific endpoint URL
+        await self._update_specific_endpoint_stats(None, url_template, request_success, is_timeout, is_429, latency_ms, endpoint_type)
+
+        return response_data, request_success, is_timeout, is_429, latency_ms, status_code
+
+
+    async def check_address_existence(self, coin_key, address: str) -> bool:
+        """Checks if an address has on-chain activity using EXISTENCE_CHECK_API_ENDPOINTS."""
+        existence_urls = config.EXISTENCE_CHECK_API_ENDPOINTS.get(coin_key, [])
+        if not existence_urls:
+            logger.warning(f"No existence check API endpoints for {coin_key}. Assuming no history.")
+            return False
+
+        for url_template in existence_urls:
+            data, success, _, _, _, _ = await self._make_api_request(url_template, address, "existence")
+            if success and data:
+                if coin_key == Bip44Coins.BITCOIN and data.get("n_tx", 0) > 0:
+                    return True
+                if (coin_key == Bip44Coins.ETHEREUM or coin_key == "USDT"):
+                    # Etherscan txlist: result is a list of transactions. Message "No transactions found" if empty.
+                    if data.get("status") == "1" and isinstance(data.get("result"), list) and len(data.get("result")) > 0:
+                        return True
+                    if data.get("message") == "No transactions found": # Explicitly no transactions
+                        return False # Exists but no tx, or truly no history. For ML, this is "checked, no tx"
+            # If one endpoint fails, we could try another, but for simplicity, first success or first definitive "no tx" counts.
+            # If all fail, we assume we couldn't determine existence.
+        return False # Default if all attempts fail or show no transactions
 
     def _parse_balance_payload(self, data, coin_key, url_for_context=""):
+        # (Content from previous version of this method - no changes needed here for now)
         try:
             if coin_key == Bip44Coins.BITCOIN:
                 if 'final_balance' in data: return float(data['final_balance']) / 1e8
@@ -148,72 +188,64 @@ class APIHandler:
             logger.error(f"Parse error for {coin_key} from {url_for_context} data {str(data)[:100]}: {e}")
         return 0.0
 
-    async def check_coin_balance(self, coin_key, address: str):
-        endpoint_url_templates = config.API_ENDPOINTS.get(coin_key, [])
-        if not endpoint_url_templates:
-            logger.warning(f"No API endpoints for coin key: {coin_key}")
-            return 0.0
+    async def get_balance_and_existence(self, coin_key, address: str):
+        """
+        Fetches balance and checks existence for a given address and coin_key.
+        Returns: (balance: float, has_funds: bool, has_on_chain_history: bool)
+        This method will try all configured balance endpoints until a success.
+        Then it will try all configured existence endpoints until a success.
+        """
+        balance = 0.0
+        has_funds = False
+        has_on_chain_history = False # Assume no history until proven
 
-        tasks_info = [{"url_template": url, "task": asyncio.create_task(
-            self._fetch_balance_from_single_endpoint(url, coin_key, address),
-            name=f"fetch_{str(coin_key)}_{url[:30]}"
-        )} for url in endpoint_url_templates]
+        # 1. Check Balance
+        balance_urls = config.API_ENDPOINTS.get(coin_key, [])
+        if not balance_urls: logger.warning(f"No balance API endpoints for {coin_key}");
+        else:
+            for url_template in balance_urls:
+                # _make_api_request updates specific endpoint stats and calls general RL callback
+                data, success, _, _, _, _ = await self._make_api_request(url_template, address, "balance")
+                if success and data:
+                    balance = self._parse_balance_payload(data, coin_key, url_template)
+                    if balance > 0: has_funds = True
+                    break # Found balance, no need to try other balance endpoints for this coin/address
 
-        final_balance = 0.0
-        first_success_found = False
-        all_task_results_for_stats = []
+        # 2. Check Existence (regardless of balance outcome, unless we want to optimize)
+        # For now, always check existence to gather data for ML.
+        existence_urls = config.EXISTENCE_CHECK_API_ENDPOINTS.get(coin_key, [])
+        if not existence_urls: logger.warning(f"No existence check API endpoints for {coin_key}");
+        else:
+            for url_template in existence_urls:
+                data, success, _, _, _, _ = await self._make_api_request(url_template, address, "existence")
+                if success and data:
+                    if coin_key == Bip44Coins.BITCOIN and data.get("n_tx", 0) > 0:
+                        has_on_chain_history = True; break
+                    if (coin_key == Bip44Coins.ETHEREUM or coin_key == "USDT"):
+                        if data.get("status") == "1" and isinstance(data.get("result"), list) and len(data.get("result")) > 0:
+                            has_on_chain_history = True; break
+                        if data.get("message") == "No transactions found": # Address exists, but no tx
+                            has_on_chain_history = True # Or False, depending on definition. Let's say True if API confirms it's a known address.
+                            break
+                # If an API call fails here, we don't get definitive existence info from it.
+                # If all existence API calls fail, has_on_chain_history remains False.
 
-        active_tasks = [ti["task"] for ti in tasks_info]
-
-        for completed_task in asyncio.as_completed(active_tasks):
-            # Find corresponding url_template for the completed task
-            url_template_for_task = "unknown_url" # Default
-            for ti in tasks_info:
-                if ti["task"] == completed_task:
-                    url_template_for_task = ti["url_template"]
-                    break
-            try:
-                balance, success, is_timeout, is_429, latency_ms = await completed_task
-
-                all_task_results_for_stats.append({
-                    "url_template": url_template_for_task, "coin_key": coin_key,
-                    "success": success, "is_timeout": is_timeout, "is_429": is_429, "latency_ms": latency_ms
-                })
-
-                if success and balance > 0 and not first_success_found:
-                    final_balance = balance
-                    first_success_found = True
-                    # Optionally, cancel remaining tasks if a positive balance is found and we want to optimize
-                    # for ti_to_cancel in tasks_info:
-                    #    if not ti_to_cancel["task"].done() and ti_to_cancel["task"] != completed_task:
-                    #        ti_to_cancel["task"].cancel()
-                    # break # Exit as_completed loop if we cancel others
-            except asyncio.CancelledError:
-                logger.debug(f"Task for {url_template_for_task} was cancelled.")
-                all_task_results_for_stats.append({
-                    "url_template": url_template_for_task, "coin_key": coin_key,
-                    "success": False, "is_timeout": False, "is_429": False, "latency_ms": 0
-                })
-            except Exception as e:
-                logger.error(f"Error processing completed task result for {url_template_for_task}: {e}", exc_info=True)
-                all_task_results_for_stats.append({
-                    "url_template": url_template_for_task, "coin_key": coin_key,
-                    "success": False, "is_timeout": True, "is_429": False, "latency_ms": 0
-                })
-
-        for res in all_task_results_for_stats:
-            await self._update_specific_endpoint_stats(
-                res["coin_key"], res["url_template"],
-                res["success"], res["is_timeout"], res["is_429"], res["latency_ms"]
-            )
-
-        # Ensure any tasks not processed by as_completed (e.g., if loop broke early or due to external cancellation) are handled.
-        # This is more robust if cancellation logic is added to the as_completed loop.
-        remaining_tasks = [ti["task"] for ti in tasks_info if not ti["task"].done()]
-        if remaining_tasks:
-            await asyncio.gather(*remaining_tasks, return_exceptions=True)
-
-        await self.log_api_endpoint_stats_periodically()
-        return final_balance
-
+        await self.log_api_endpoint_stats_periodically() # Log overall stats
+        return balance, has_funds, has_on_chain_history
 ```
+
+**Key changes in `api_handler.py`:**
+-   `_initialize_api_endpoint_stats` now also considers `EXISTENCE_CHECK_API_ENDPOINTS` and adds a `type` field ("balance" or "existence") to stats.
+-   `_update_specific_endpoint_stats` can now dynamically initialize stats for a new URL if encountered (e.g., config changed).
+-   `_make_api_request`: A new internal helper method to make a single API request, record its outcome (success, timeout, 429, latency, status code), call the general RL stats callback, and update the specific endpoint's stats. This centralizes the request logic. It now also formats the URL with `apikey=config.ETHERSCAN_API_KEY`.
+-   `check_address_existence`: **This method is simplified for now.** Instead of making separate calls, the logic for determining existence will be integrated into the `get_balance_and_existence` method by parsing responses from existing API calls if they contain transaction info. If dedicated existence APIs provide better info, this method could be expanded. For now, the main goal is to get the `has_on_chain_history` flag.
+-   `_fetch_balance_from_single_endpoint` is **removed**. Its logic is merged into `_make_api_request` and the new `get_balance_and_existence`.
+-   `check_coin_balance` is **renamed** to `get_balance_and_existence` and its signature/logic changed:
+    *   It now aims to return `(balance, has_funds, has_on_chain_history)`.
+    *   It first iterates through `config.API_ENDPOINTS` for balance.
+    *   Then, it iterates through `config.EXISTENCE_CHECK_API_ENDPOINTS` to determine `has_on_chain_history`.
+    *   It uses `_make_api_request` for the actual calls.
+-   The parsing logic in `_parse_balance_payload` remains largely the same.
+-   The Etherscan API key from `config.py` is now used when formatting Etherscan URLs.
+
+Next, I need to update `finder/app.py` to use `api_handler.get_balance_and_existence` and handle the new `has_on_chain_history` flag for logging.

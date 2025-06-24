@@ -11,10 +11,22 @@ from aiolimiter import AsyncLimiter
 # import aiofiles # No longer needed for checked.txt, only if input_file was async
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing # For MnemonicGeneratorManager
+import time # For DQN cycle timing & profiling
+import numpy as np # For DQN states
+import tracemalloc # For memory profiling
+import cProfile # For performance profiling
+import pstats # For processing cProfile stats
+import io # For capturing cProfile output to string
+import argparse # For command-line arguments
 
 # Import the new mnemonic generator
+# Modular imports from the previous refactoring (assuming they are now in place)
+import finder.config as config
+import finder.logger_setup as logger_setup
 from finder.mnemonic_generator import MnemonicGeneratorManager, save_current_index as save_generator_index, load_initial_index as load_generator_index
-from finder.dqn_agent import DQNAgent # Import the DQN Agent
+from finder.dqn_agent import DQNAgent
+from finder.api_handler import APIHandler
+
 
 if getattr(sys, 'frozen', False):
     # PyInstaller bundle path
