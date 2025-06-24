@@ -97,6 +97,28 @@ GUI_MAX_TREE_ITEMS = 300 # Max items in checked wallets tree view
 # --- Seeds ---
 SEED_RL_AGENT = 42
 SEED_WC_AGENT = 123
+
+# --- ML Model Integration ---
+# Path to the trained classifier model for predicting on-chain history.
+# Assumes the model is saved by analysis/train_classifier_model.py
+# This path needs to be accessible by app.py.
+# If app.py is in finder/, and analysis/ is a sibling to finder/, this path might be:
+# os.path.join(os.path.dirname(BASE_DIR), "analysis", "ml_models_output", "wallet_history_classifier.joblib")
+# For simplicity, let's assume it's placed in a location accessible like this:
+CLASSIFIER_MODEL_HISTORY_PATH = os.path.join(BASE_DIR, "ml_models", "wallet_history_classifier.joblib")
+# Ensure the "ml_models" subfolder is created inside "finder" if using this path.
+# Or, if models are in analysis/ml_models_output, adjust path accordingly:
+# CLASSIFIER_MODEL_HISTORY_PATH = os.path.join(os.path.dirname(BASE_DIR), "analysis", "ml_models_output", "wallet_history_classifier.joblib")
+
+# Flag to enable/disable classifier integration
+ENABLE_CLASSIFIER_SCORING = False # Default to False, enable for experimentation
+
+# --- Web Server (for React UI API) ---
+WEB_SERVER_HOST = "127.0.0.1" # Default to localhost
+WEB_SERVER_PORT = 8080
+WEBSOCKET_MAX_MESSAGE_SIZE = 1024 * 1024 # 1MB max message size for WebSocket
+# CORS_ALLOWED_ORIGINS = ["http://localhost:3000"] # Example for React dev server on port 3000
+CORS_ALLOWED_ORIGINS = ["*"] # Allow all for simplicity in dev, tighten for production
 ```
 
 `config.py` updated with `EXISTENCE_CHECK_API_ENDPOINTS` and `ETHERSCAN_API_KEY` placeholder. Also, `NUM_CHILD_ADDRESSES_TO_CHECK` is now 10 as per the previous plan step (Wallet Processing).
