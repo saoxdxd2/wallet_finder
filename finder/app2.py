@@ -29,49 +29,127 @@ class ProcessManager:
             return f.read()
         
     def run_cycle(self):
+        # Now, app.py is the single engine that includes generation and checking.
+        # We run it as one persistent process.
+        target_script = 'finder/app.py' # Relative to project root if running app2.py from root
+        # If app2.py is in finder/, then 'app.py'
+        # Assuming app2.py is run from the project root like "python finder/app2.py"
+        # Or, if packaged, determine path to app.py or the executable.
+
+        # For development:
+        cmd = [sys.executable, target_script] # sys.executable is the current python interpreter
+
+        # If this were a packaged app, cmd would be path to the main executable.
+        # Example: cmd = [self._get_main_executable_path()]
+
         while self.running:
             try:
-                self._log("Starting generator...")
-                go_proc = subprocess.Popen(['go', 'run', 'app.go'], 
-                                        stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT)
-                self._monitor_process(go_proc, 60)
+                self._log("Starting main application engine (app.py)...")
+                # Use subprocess.PIPE for stdout and stderr to capture logs
+                self.current_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, # Merge stderr to stdout
+                    text=True, # Decode output as text
+                    bufsize=1,  # Line buffered
+                    universal_newlines=True # Ensure text mode for newlines
+                )
+                self._log(f"Main application engine started with PID: {self.current_process.pid}")
                 
-                self._log("Starting checker...")
-                py_proc = subprocess.Popen(['python', 'app.py'], 
-                                         stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT)
-                self._monitor_process(py_proc)
-            except Exception as e:
-                self._log(f"Error: {str(e)}")
+                # Monitor its output
+                self._read_output(self.current_process) # This will block until process ends or error
 
-    def _monitor_process(self, proc, timeout=None):
-        start = time.time()
-        threading.Thread(target=self._read_output, args=(proc,), daemon=True).start()
-        
-        while proc.poll() is None and self.running:
-            if timeout and time.time() - start > timeout:
-                proc.terminate()
+                if not self.running: # If stop was called during _read_output
+                    self._log("Process manager was stopped, terminating engine.")
+                    if self.current_process.poll() is None:
+                        self.current_process.terminate()
+                        try:
+                            self.current_process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            self.current_process.kill()
+                    break # Exit while loop
+
+                # If process ended by itself and we are still supposed to be running
+                if self.running:
+                    self._log("Main application engine stopped unexpectedly. Restarting in 5 seconds...")
+                    time.sleep(5) # Wait before restarting
+
+            except FileNotFoundError:
+                self._log(f"Error: Could not find the application script/executable: {' '.join(cmd)}")
+                self._log("Please ensure app.py is in the correct location or the application is built correctly.")
+                self.running = False # Stop trying if script not found
                 break
-            time.sleep(1)
-        
-        if proc.poll() is None:
-            proc.terminate()
-        proc.wait()
+            except Exception as e:
+                self._log(f"Error in run_cycle: {str(e)}")
+                if self.running:
+                    self._log("Restarting after error in 5 seconds...")
+                    time.sleep(5) # Wait before restarting
+
+        self._log("Run cycle ended.")
+
 
     def _read_output(self, proc):
-        for line in iter(proc.stdout.readline, b''):
-            self._log(line.decode().strip())
+        # Reads output line by line and puts it into the log_queue
+        # This runs in the ProcessManager's main thread (run_cycle's thread)
+        if proc.stdout:
+            for line in iter(proc.stdout.readline, ''):
+                if not self.running: # Check if stop was called
+                    break
+                if line:
+                    self._log(line.strip())
+            proc.stdout.close()
+
+        # Wait for the process to complete, store return code
+        return_code = proc.wait()
+        self._log(f"Main application engine exited with code {return_code}.")
+
 
     def _log(self, msg):
         self.log_queue.put(msg)
 
     def start(self):
+        if self.running:
+            self._log("Process manager already running.")
+            return
         self.running = True
-        threading.Thread(target=self.run_cycle, daemon=True).start()
+        self.current_process = None
+        # The run_cycle will be managed by a thread
+        self.thread = threading.Thread(target=self.run_cycle, daemon=True)
+        self.thread.start()
+        self._log("Process manager started.")
+
 
     def stop(self):
-        self.running = False
+        if not self.running:
+            self._log("Process manager not running.")
+            return
+
+        self._log("Stopping process manager...")
+        self.running = False # Signal run_cycle and _read_output to stop
+
+        if hasattr(self, 'current_process') and self.current_process and self.current_process.poll() is None:
+            self._log(f"Terminating main application engine (PID: {self.current_process.pid})...")
+            self.current_process.terminate() # Send SIGTERM
+            try:
+                self.current_process.wait(timeout=10) # Wait for graceful shutdown
+                self._log("Main application engine terminated.")
+            except subprocess.TimeoutExpired:
+                self._log("Main application engine did not terminate gracefully, killing...")
+                self.current_process.kill() # Send SIGKILL
+                try:
+                    self.current_process.wait(timeout=5)
+                    self._log("Main application engine killed.")
+                except Exception as e:
+                    self._log(f"Error during kill: {e}")
+            except Exception as e: # Other errors during termination
+                 self._log(f"Error during termination: {e}")
+
+        if hasattr(self, 'thread') and self.thread.is_alive():
+            self.thread.join(timeout=5) # Wait for the run_cycle thread to exit
+            if self.thread.is_alive():
+                self._log("Process manager thread did not exit cleanly.")
+
+        self._log("Process manager stopped.")
 
 class WalletGUI(tk.Tk):
     def __init__(self):
