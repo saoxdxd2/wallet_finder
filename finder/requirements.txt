@@ -6,3 +6,4 @@ torch==2.2.1 # Or a version compatible with your environment
 # torchvision and torchaudio might be installed alongside torch, specify if particular versions are needed.
 # For CPU only, you can often use torch compiled for CPU to save space/download time.
 # e.g. torch==2.2.1+cpu (check availability for your OS/Python version on PyTorch website)
+PySide6==6.6.2 # Or latest stable version

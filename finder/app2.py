@@ -1,304 +1,229 @@
+import sys
+import os
 import time
-import tkinter as tk
-from tkinter import ttk, scrolledtext
+import json
+from datetime import datetime
 import subprocess
 import threading
-import queue
-import json
-import os
-from datetime import datetime
-import tempfile
-import sys
 
-class ProcessManager:
-    def __init__(self, log_queue):
-        self.log_queue = log_queue
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QTextEdit, QVBoxLayout, QHBoxLayout, QWidget,
+    QMessageBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QLabel, QSplitter
+)
+from PySide6.QtCore import Qt, QTimer, Slot, Signal, QObject
+from PySide6.QtGui import QFont, QFontMetrics
+
+# Modular imports - ensure these are accessible
+import finder.config as config
+import finder.logger_setup as logger_setup
+import logging
+
+module_logger = logging.getLogger(__name__)
+
+class ProcessManager(QObject):
+    log_message = Signal(str)
+    process_finished = Signal(int)
+    process_error = Signal(str)
+
+    def __init__(self, target_script_name="app.py"):
+        super().__init__()
+        self.target_script_name = target_script_name
         self.running = False
+        self.process = None
+        self._thread = None
+        module_logger.debug("ProcessManager initialized.")
 
+    def _get_script_path(self):
+        # Assumes this GUI script (app_pyside.py or app2.py) is in the 'finder' directory,
+        # and the backend script (app.py) is also in the 'finder' directory.
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        script_path = os.path.join(current_dir, self.target_script_name)
+        if os.path.exists(script_path):
+            return script_path
 
-    def _read_embedded(self, name):
-        """Read embedded binary from package"""
+        module_logger.error(f"Backend script {self.target_script_name} not found at {script_path}")
+        return None
+
+    def _run_target(self):
+        script_to_run = self._get_script_path()
+        if not script_to_run:
+            err_msg = f"Backend script '{self.target_script_name}' could not be located."
+            self.log_message.emit(err_msg); self.process_error.emit(err_msg); self.running = False; return
+
         try:
-            # PyInstaller bundle path
-            base_path = sys._MEIPASS
-        except AttributeError:
-            base_path = os.path.abspath(".")
-            
-        file_path = os.path.join(base_path, name)
-        with open(file_path, "rb") as f:
-            return f.read()
-        
-    def run_cycle(self):
-        # Now, app.py is the single engine that includes generation and checking.
-        # We run it as one persistent process.
-        target_script = 'finder/app.py' # Relative to project root if running app2.py from root
-        # If app2.py is in finder/, then 'app.py'
-        # Assuming app2.py is run from the project root like "python finder/app2.py"
-        # Or, if packaged, determine path to app.py or the executable.
-
-        # For development:
-        cmd = [sys.executable, target_script] # sys.executable is the current python interpreter
-
-        # If this were a packaged app, cmd would be path to the main executable.
-        # Example: cmd = [self._get_main_executable_path()]
-
-        while self.running:
-            try:
-                self._log("Starting main application engine (app.py)...")
-                # Use subprocess.PIPE for stdout and stderr to capture logs
-                self.current_process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT, # Merge stderr to stdout
-                    text=True, # Decode output as text
-                    bufsize=1,  # Line buffered
-                    universal_newlines=True # Ensure text mode for newlines
-                )
-                self._log(f"Main application engine started with PID: {self.current_process.pid}")
-                
-                # Monitor its output
-                self._read_output(self.current_process) # This will block until process ends or error
-
-                if not self.running: # If stop was called during _read_output
-                    self._log("Process manager was stopped, terminating engine.")
-                    if self.current_process.poll() is None:
-                        self.current_process.terminate()
-                        try:
-                            self.current_process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            self.current_process.kill()
-                    break # Exit while loop
-
-                # If process ended by itself and we are still supposed to be running
-                if self.running:
-                    self._log("Main application engine stopped unexpectedly. Restarting in 5 seconds...")
-                    time.sleep(5) # Wait before restarting
-
-            except FileNotFoundError:
-                self._log(f"Error: Could not find the application script/executable: {' '.join(cmd)}")
-                self._log("Please ensure app.py is in the correct location or the application is built correctly.")
-                self.running = False # Stop trying if script not found
-                break
-            except Exception as e:
-                self._log(f"Error in run_cycle: {str(e)}")
-                if self.running:
-                    self._log("Restarting after error in 5 seconds...")
-                    time.sleep(5) # Wait before restarting
-
-        self._log("Run cycle ended.")
-
-
-    def _read_output(self, proc):
-        # Reads output line by line and puts it into the log_queue
-        # This runs in the ProcessManager's main thread (run_cycle's thread)
-        if proc.stdout:
-            for line in iter(proc.stdout.readline, ''):
-                if not self.running: # Check if stop was called
-                    break
-                if line:
-                    self._log(line.strip())
-            proc.stdout.close()
-
-        # Wait for the process to complete, store return code
-        return_code = proc.wait()
-        self._log(f"Main application engine exited with code {return_code}.")
-
-
-    def _log(self, msg):
-        self.log_queue.put(msg)
+            self.log_message.emit(f"Starting backend: {sys.executable} {script_to_run}")
+            self.process = subprocess.Popen(
+                [sys.executable, script_to_run],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, universal_newlines=True,
+                cwd=os.path.dirname(script_to_run)
+            )
+            self.log_message.emit(f"Backend process (PID: {self.process.pid}) started. Monitoring output...")
+            if self.process.stdout:
+                for line in iter(self.process.stdout.readline, ''):
+                    if not self.running: break
+                    if line: self.log_message.emit(line.strip())
+                self.process.stdout.close()
+            return_code = self.process.wait()
+            self.process_finished.emit(return_code)
+        except Exception as e:
+            err_msg = f"Error in ProcessManager _run_target: {str(e)}"
+            self.log_message.emit(err_msg); self.process_error.emit(err_msg)
+            module_logger.error(err_msg, exc_info=True)
+        finally:
+            self.running = False
+            module_logger.info(f"ProcessManager thread finished for {script_to_run if script_to_run else 'unknown script'}.")
 
     def start(self):
-        if self.running:
-            self._log("Process manager already running.")
-            return
+        if self.running: self.log_message.emit("Process manager: Backend already running."); return
         self.running = True
-        self.current_process = None
-        # The run_cycle will be managed by a thread
-        self.thread = threading.Thread(target=self.run_cycle, daemon=True)
-        self.thread.start()
-        self._log("Process manager started.")
-
+        self._thread = threading.Thread(target=self._run_target, daemon=True); self._thread.start()
+        self.log_message.emit("Process manager: Backend start initiated.")
 
     def stop(self):
-        if not self.running:
-            self._log("Process manager not running.")
-            return
+        if not self.running and not (self.process and self.process.poll() is None) :
+            self.log_message.emit("Process manager: Backend not running or already stopped."); self.running = False; return
 
-        self._log("Stopping process manager...")
-        self.running = False # Signal run_cycle and _read_output to stop
-
-        if hasattr(self, 'current_process') and self.current_process and self.current_process.poll() is None:
-            self._log(f"Terminating main application engine (PID: {self.current_process.pid})...")
-            self.current_process.terminate() # Send SIGTERM
+        pid_info = self.process.pid if self.process else 'N/A'
+        self.log_message.emit(f"Process manager: Stopping backend (PID: {pid_info})...")
+        self.running = False
+        if self.process and self.process.poll() is None:
             try:
-                self.current_process.wait(timeout=10) # Wait for graceful shutdown
-                self._log("Main application engine terminated.")
-            except subprocess.TimeoutExpired:
-                self._log("Main application engine did not terminate gracefully, killing...")
-                self.current_process.kill() # Send SIGKILL
-                try:
-                    self.current_process.wait(timeout=5)
-                    self._log("Main application engine killed.")
-                except Exception as e:
-                    self._log(f"Error during kill: {e}")
-            except Exception as e: # Other errors during termination
-                 self._log(f"Error during termination: {e}")
+                self.process.terminate(); self.log_message.emit("Process manager: Sent SIGTERM.")
+                try: self.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.log_message.emit("Process manager: Backend kill timeout, sending SIGKILL."); self.process.kill(); self.process.wait(timeout=1)
+            except Exception as e: module_logger.error(f"Error during termination: {e}", exc_info=True)
+        elif self.process: self.log_message.emit(f"Process manager: Backend already exited (code {self.process.returncode}).")
+        else: self.log_message.emit("Process manager: No backend process to stop.")
+        if self._thread and self._thread.is_alive(): self._thread.join(timeout=1)
+        self.process = None; module_logger.info("ProcessManager stop sequence complete.")
 
-        if hasattr(self, 'thread') and self.thread.is_alive():
-            self.thread.join(timeout=5) # Wait for the run_cycle thread to exit
-            if self.thread.is_alive():
-                self._log("Process manager thread did not exit cleanly.")
-
-        self._log("Process manager stopped.")
-
-class WalletGUI(tk.Tk):
+class WalletGUI(QMainWindow):
+    new_checked_line_signal = Signal(str)
     def __init__(self):
         super().__init__()
-        self.title("Crypto Wallet Scanner")
-        self.geometry("1400x900")
-        self.last_inode = None
-        self.file_version = 0
-        
-        # UI setup
-        main_frame = ttk.PanedWindow(self, orient=tk.VERTICAL)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.setWindowTitle(config.GUI_WINDOW_TITLE + " (PySide6)"); self.setGeometry(100, 100, 1200, 800)
+        module_logger.info("WalletGUI initializing..."); self._init_ui(); self.disclaimer_accepted = False
+        if not self.show_disclaimer():
+            module_logger.warning("Disclaimer not accepted. Exiting."); QTimer.singleShot(0, self.close); return
+        self.disclaimer_accepted = True; module_logger.info("Disclaimer accepted.")
+        self.process_manager = ProcessManager(); self.process_manager.log_message.connect(self.append_to_log_view)
+        self.process_manager.process_finished.connect(self.on_backend_finished)
+        self.process_manager.process_error.connect(self.on_backend_error); self.process_manager.start()
+        self.checked_file_monitor_thread = None; self.stop_file_monitoring = threading.Event()
+        self.start_checked_file_monitor(); self.new_checked_line_signal.connect(self.process_checked_entry_from_signal)
+        self.total_checked_count = 0; self.total_found_count = 0; module_logger.info("WalletGUI init complete.")
 
-        # Log section
-        log_frame = ttk.Frame(main_frame)
-        self.log_view = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=15)
-        self.log_view.pack(fill=tk.BOTH, expand=True)
-        main_frame.add(log_frame)
+    def _init_ui(self):
+        main_widget = QWidget(); self.setCentralWidget(main_widget); v_layout = QVBoxLayout(main_widget)
+        top_splitter = QSplitter(Qt.Horizontal); self.checked_tree = QTreeWidget(); self.checked_tree.setColumnCount(4)
+        self.checked_tree.setHeaderLabels(['Time', 'Mnemonic (Elided)', 'BTC', 'ETH'])
+        header = self.checked_tree.header(); header.setSectionResizeMode(QHeaderView.Stretch); header.setStretchLastSection(False)
+        header.resizeSection(0, 100); header.resizeSection(1, 350); header.resizeSection(2, 100); header.resizeSection(3, 100)
+        self.checked_tree.setAlternatingRowColors(True); top_splitter.addWidget(self.checked_tree)
+        stats_widget = QWidget(); stats_layout = QVBoxLayout(stats_widget); stats_layout.setAlignment(Qt.AlignTop)
+        self.total_label = QLabel("Total Checked: 0"); self.found_label = QLabel("Found with Balance: 0")
+        stats_layout.addWidget(self.total_label); stats_layout.addWidget(self.found_label)
+        stats_widget.setFixedWidth(200); top_splitter.addWidget(stats_widget); top_splitter.setSizes([800, 200])
+        self.log_view = QTextEdit(); self.log_view.setReadOnly(True); self.log_view.setFont(QFont("Courier", 9))
+        main_splitter = QSplitter(Qt.Vertical); main_splitter.addWidget(top_splitter); main_splitter.addWidget(self.log_view)
+        main_splitter.setSizes([500, 300]); v_layout.addWidget(main_splitter); module_logger.debug("UI initialized.")
 
-        # Results section
-        results_frame = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
-        
-        # Checked wallets
-        checked_pane = ttk.Frame(results_frame)
-        self.checked_tree = ttk.Treeview(checked_pane, 
-            columns=('Time', 'Mnemonic', 'BTC', 'ETH'), 
-            show='headings'
-        )
-        self.checked_tree.heading('Time', text='Time')
-        self.checked_tree.heading('Mnemonic', text='Mnemonic (First 15 chars)')
-        self.checked_tree.heading('BTC', text='BTC Balance')
-        self.checked_tree.heading('ETH', text='ETH Balance')
-        
-        vsb = ttk.Scrollbar(checked_pane, orient="vertical", command=self.checked_tree.yview)
-        hsb = ttk.Scrollbar(checked_pane, orient="horizontal", command=self.checked_tree.xview)
-        self.checked_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        
-        self.checked_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        hsb.pack(side=tk.BOTTOM, fill=tk.X)
-        results_frame.add(checked_pane)
+    def show_disclaimer(self):
+        title = "Ethical Use Agreement"
+        full_message = ("IMPORTANT: ETHICAL AND LEGAL USE ACKNOWLEDGEMENT\n\n"
+            "This software, Crypto Wallet Scanner, is intended strictly for educational and research purposes.\n\n"
+            "By proceeding, you acknowledge and agree to the following:\n"
+            "1. Lawful Use: You will use this software in compliance with all applicable laws.\n"
+            "2. No Unauthorized Access: You will NOT use this software to attempt to access assets for which you do not have explicit authorization.\n"
+            "3. Educational Purpose Only: Understand that this is for learning about blockchain technology and security.\n"
+            "4. No Financial Harm: You will not use this software in any way that could cause financial harm.\n"
+            "5. Responsibility: You are solely responsible for your actions. Developers disclaim liability for misuse.\n\n"
+            "Do you understand these terms and agree to use this software ethically, legally, and responsibly?")
+        reply = QMessageBox.question(self, title, full_message, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        return reply == QMessageBox.StandardButton.Yes
 
-        # Stats panel
-        stats_frame = ttk.Frame(results_frame, width=300)
-        stats_frame.pack_propagate(False)
-        self.total_label = ttk.Label(stats_frame, text="Total Checked: 0", font=('Arial', 14))
-        self.total_label.pack(pady=10)
-        self.found_label = ttk.Label(stats_frame, text="Found with Balance: 0", font=('Arial', 12))
-        self.found_label.pack(pady=10)
-        results_frame.add(stats_frame)
+    @Slot(str)
+    def append_to_log_view(self, text): self.log_view.append(text); self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+    @Slot(int)
+    def on_backend_finished(self, exit_code): self.append_to_log_view(f"--- Backend process finished (code: {exit_code}) ---")
+    @Slot(str)
+    def on_backend_error(self, error_message):
+        self.append_to_log_view(f"--- Backend Error: {error_message} ---");
+        if self.isVisible() and QApplication.instance() and QApplication.instance().applicationState() == Qt.ApplicationActive:
+            QMessageBox.critical(self, "Backend Error", error_message)
 
-        main_frame.add(results_frame)
+    def _monitor_checked_file(self):
+        module_logger.info("Checked file monitor thread started."); last_pos = 0; seen_entries = set()
+        checked_file_path = config.CHECKED_WALLETS_FILE_PATH
+        while not self.stop_file_monitoring.is_set():
+            try:
+                if not os.path.exists(checked_file_path): time.sleep(1); continue
+                with open(checked_file_path, 'r', encoding='utf-8') as f:
+                    current_file_size = os.path.getsize(checked_file_path)
+                    if current_file_size < last_pos:
+                        module_logger.info("Checked file appears smaller; resetting read position.")
+                        last_pos = 0
+                    f.seek(last_pos); new_lines = f.readlines(); last_pos = f.tell()
+                for line in new_lines:
+                    line_stripped = line.strip()
+                    if line_stripped and line_stripped not in seen_entries:
+                        self.new_checked_line_signal.emit(line_stripped); seen_entries.add(line_stripped)
+                        if len(seen_entries) > 10000: seen_entries = set(list(seen_entries)[-5000:])
+                time.sleep(0.5)
+            except Exception as e: module_logger.error(f"Error in checked file monitor: {e}", exc_info=False); time.sleep(2)
+        module_logger.info("Checked file monitor thread stopped.")
 
-        # Initialize
-        self.log_queue = queue.Queue()
-        self.process_manager = ProcessManager(self.log_queue)
-        self.last_pos = 0
-        self.total_checked = 0
-        self.total_found = 0
-        self.seen_entries = set()
-        
-        # Start processes
-        self.process_manager.start()
-        self.after(100, self.update_log)
-        self.after(500, self.update_checked)
-        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+    def start_checked_file_monitor(self):
+        if self.checked_file_monitor_thread and self.checked_file_monitor_thread.is_alive(): return
+        self.stop_file_monitoring.clear(); self.checked_file_monitor_thread = threading.Thread(target=self._monitor_checked_file, daemon=True); self.checked_file_monitor_thread.start()
 
-    def update_log(self):
-        while not self.log_queue.empty():
-            msg = self.log_queue.get()
-            self.log_view.insert(tk.END, msg + "\n")
-            self.log_view.see(tk.END)
-        self.after(100, self.update_log)
-
-    def update_checked(self):
+    @Slot(str)
+    def process_checked_entry_from_signal(self, line_str):
         try:
-            if os.path.exists('checked.txt'):
-            # Get current file stats
-                current_stat = os.stat('checked.txt')
-                current_inode = current_stat.st_ino
-                current_size = current_stat.st_size
+            parts = line_str.strip().split('|', 3);
+            if len(parts) != 4: return
+            _, ts_str, mne, bal_json = parts; bals = json.loads(bal_json)
+            
+            btc_bal_str = f"{bals.get(config.Bip44Coins.BITCOIN.name, 0.0):.8f}"
+            eth_bal_str = f"{bals.get(config.Bip44Coins.ETHEREUM.name, 0.0):.8f}"
+            
+            fm = QFontMetrics(self.checked_tree.font()); el_mne = fm.elidedText(mne, Qt.ElideRight, self.checked_tree.columnWidth(1)-20)
+            try: disp_time = datetime.fromisoformat(ts_str).strftime("%H:%M:%S")
+            except ValueError: disp_time = ts_str
+            item = QTreeWidgetItem([disp_time, el_mne, btc_bal_str, eth_bal_str]); item.setData(1, Qt.UserRole, mne)
+            self.checked_tree.addTopLevelItem(item)
+            if self.checked_tree.topLevelItemCount() > (config.GUI_MAX_TREE_ITEMS if hasattr(config, 'GUI_MAX_TREE_ITEMS') else 300):
+                self.checked_tree.takeTopLevelItem(0)
+            self.checked_tree.scrollToBottom()
+            self.total_checked_count += 1
+            if bals.get(config.Bip44Coins.BITCOIN.name,0.0)>0 or bals.get(config.Bip44Coins.ETHEREUM.name,0.0)>0 or bals.get("USDT",0.0)>0: self.total_found_count +=1
+            self.total_label.setText(f"Total Checked: {self.total_checked_count}"); self.found_label.setText(f"Found with Balance: {self.total_found_count}")
+        except Exception as e: module_logger.error(f"Error processing GUI entry '{line_str[:60]}...': {e}", exc_info=True)
 
-            # Reset position if file has been rotated
-                if hasattr(self, 'last_inode'):
-                    if current_inode != self.last_inode or current_size < self.last_pos:
-                        self.last_pos = 0
-                    
-                self.last_inode = current_inode
-            
-                with open('checked.txt', 'r') as f:
-                # Reset position if file is smaller than last position
-                    if current_size < self.last_pos:
-                        self.last_pos = 0
-                
-                    f.seek(self.last_pos)
-                    new_lines = f.readlines()
-                    self.last_pos = f.tell()
+    def closeEvent(self, event):
+        module_logger.info("Close event. Shutting down application and backend...");
+        self.stop_file_monitoring.set()
+        if self.process_manager: self.process_manager.stop()
+        if self.checked_file_monitor_thread and self.checked_file_monitor_thread.is_alive():
+            self.checked_file_monitor_thread.join(timeout=1)
+        event.accept()
 
-                    for line in new_lines:
-                        if line.strip() and line not in self.seen_entries:
-                            self.process_entry(line)
-                            self.seen_entries.add(line)
-        except Exception as e:
-            pass
-        finally:
-            self.after(500, self.update_checked)
+if __name__ == '__main__':
+    logger_setup.setup_logging();
+    os.makedirs(config.MODELS_DIR, exist_ok=True)
+    if hasattr(config, 'LOG_DIR') and config.LOG_DIR and not os.path.exists(config.LOG_DIR):
+        os.makedirs(config.LOG_DIR, exist_ok=True)
 
-    def process_entry(self, line):
-        try:
-            parts = line.strip().split('|', 2)
-            if len(parts) != 3:
-                return
-                
-            timestamp, mnemonic, balance_str = parts
-            balances = json.loads(balance_str)
-            
-            btc = balances.get('BITCOIN', 0)
-            eth = balances.get('ETHEREUM', 0)
-            
-            self.total_checked += 1
-            if btc > 0 or eth > 0:
-                self.total_found += 1
-            
-            dt = datetime.fromisoformat(timestamp)
-            display_time = dt.strftime("%m/%d %H:%M:%S")
-            display_mnemonic = mnemonic[:15] + '...' if len(mnemonic) > 15 else mnemonic
-            
-            self.checked_tree.insert('', 'end', values=(
-                display_time,
-                display_mnemonic,
-                f"{btc:.8f}",
-                f"{eth:.8f}"
-            ))
-            
-            if len(self.checked_tree.get_children()) > 200:
-                self.checked_tree.delete(self.checked_tree.get_children()[0])
-            
-            self.total_label.config(text=f"Total Checked: {self.total_checked}")
-            self.found_label.config(text=f"Found with Balance: {self.total_found}")
-            
-        except json.JSONDecodeError:
-            pass
-        except Exception as e:
-            pass
+    app = QApplication(sys.argv)
+    main_window = WalletGUI()
 
-    def on_closing(self):
-        self.process_manager.stop()
-        self.destroy()
+    if not main_window.disclaimer_accepted:
+        module_logger.info("Disclaimer not accepted during __init__, exiting application via __main__ check.")
+        sys.exit(0)
 
-if __name__ == "__main__":
-    app = WalletGUI()
-    app.mainloop()
+    main_window.show()
+    sys.exit(app.exec())
+
+```
