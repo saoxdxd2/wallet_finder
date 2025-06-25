@@ -31,6 +31,7 @@ from finder.mnemonic_generator import (
 from finder.ppo_sb3_agent import PPOAgentSB3
 from finder.api_handler import APIHandler
 from finder.features import extract_mnemonic_features # extract_address_features is not used yet
+from finder.task import Task # Import the Task class
 
 
 # Configure a logger for this module
@@ -588,31 +589,27 @@ class BalanceChecker:
 
         while not self._stop_event.is_set():
             await self._pause_event.wait() # Respect pause
-            mnemonic = None # Ensure mnemonic is defined for logging in case of early exception
+            current_task_object: Optional[Task] = None
+            mnemonic_phrase: Optional[str] = None
             try:
-                mnemonic = await asyncio.wait_for(self.async_mnemonic_queue.get(), timeout=1.0)
-                if mnemonic is None: # Sentinel for shutdown (though _stop_event should catch first)
-                    self.async_mnemonic_queue.task_done() # Mark as done if using queue joining
+                mnemonic_phrase = await asyncio.wait_for(self.async_mnemonic_queue.get(), timeout=1.0)
+                if mnemonic_phrase is None: # Sentinel for shutdown
+                    self.async_mnemonic_queue.task_done()
                     break
 
-                # Tentative index for this mnemonic.
-                # This assumes mnemonics are processed roughly in order from the queue.
-                # For absolute correctness with out-of-order processing (if workers are very different speeds),
-                # the mnemonic itself would need to carry its original index from the generator.
-                # The current MnemonicGeneratorManager (from mnemonic_generator.py) does not add index to queue.
-                # So, this sequential indexing is the best effort.
+                # Create a Task object for the current mnemonic
+                # The index for the task will be the next sequential processed index.
                 current_processed_idx = self.processed_mnemonic_index + 1
+                current_task_object = Task(mnemonic_phrase=mnemonic_phrase, index=current_processed_idx)
 
                 # 1. Generate addresses for all configured coins
-                # 1. Generate addresses for all configured coins using the imported function
-                # This is a CPU-bound task, run in executor
-                derived_addresses_by_coin = await asyncio.get_running_loop().run_in_executor(
+                derived_addresses_by_coin_enum = await asyncio.get_running_loop().run_in_executor(
                     self.executor,
-                    generate_addresses_with_paths, # Imported from mnemonic_generator.py
-                    mnemonic, coins_to_process, num_child_addrs, bip44_account, bip44_change_val
+                    generate_addresses_with_paths,
+                    current_task_object.mnemonic_phrase, coins_to_process, num_child_addrs, bip44_account, bip44_change_val
                 )
+                current_task_object.set_derived_addresses(derived_addresses_by_coin_enum)
 
-                all_address_details_for_log = []
                 found_any_balance_for_mnemonic = False
                 history_score = 0.0 # Default if classifier not used or fails
 
@@ -620,61 +617,53 @@ class BalanceChecker:
                 if self.config.ENABLE_CLASSIFIER_SCORING and self.classifier_history_model:
                     try:
                         mnemonic_features = await asyncio.get_running_loop().run_in_executor(
-                            self.executor, extract_mnemonic_features, mnemonic
+                            self.executor, extract_mnemonic_features, current_task_object.mnemonic_phrase
                         )
-                        # Model expects a 2D array
                         score_proba = await asyncio.get_running_loop().run_in_executor(
                              self.executor, self.classifier_history_model.predict_proba, [mnemonic_features]
                         )
-                        history_score = score_proba[0][1] # Probability of the positive class (has history)
-                        # Optional: if score is too low, skip API calls for this mnemonic (config.CLASSIFIER_SKIP_THRESHOLD)
+                        history_score = score_proba[0][1]
                         if history_score < self.config.CLASSIFIER_SKIP_THRESHOLD:
-                            logger.debug(f"Skipping mnemonic {mnemonic[:15]} due to low history score: {history_score:.3f}")
-                            # Still need to log it as checked, but without balance/tx details
-                            # For now, continue processing to get full data, but this is where skip would go.
+                            logger.debug(f"Skipping Task {current_task_object.index} (mnemonic {current_task_object.mnemonic_phrase[:15]}...) due to low history score: {history_score:.3f}")
+                            # If skipping, we might want to log it differently or mark task as skipped.
+                            # For now, it will proceed but the score is available.
                     except Exception as e:
-                        logger.error(f"Error during mnemonic classification: {e}", exc_info=True)
+                        logger.error(f"Error during mnemonic classification for Task {current_task_object.index}: {e}", exc_info=True)
+                        current_task_object.error_message = f"Classifier error: {e}"
 
 
                 # 2. For each coin and its derived addresses, check balance and existence
-                for coin_type, child_addresses_info in derived_addresses_by_coin.items():
-                    coin_name_str = coin_type.name # For logging keys
+                # Iterate through the addresses stored in the Task object
+                for coin_name_str, child_addresses_info_list in current_task_object.derived_addresses.items():
+                    # Need to map coin_name_str back to Bip44Coins enum for APIHandler
+                    # This assumes coin_name_str is a valid Bip44Coins member name.
+                    try:
+                        coin_type_enum = Bip44Coins[coin_name_str]
+                    except KeyError:
+                        logger.error(f"Invalid coin name '{coin_name_str}' in Task {current_task_object.index}. Skipping checks for this coin.")
+                        continue
 
-                    for child_addr_info in child_addresses_info:
-                        address_str = child_addr_info["address"]
-                        derivation_path = child_addr_info["path"]
+                    for child_addr_detail in child_addresses_info_list:
+                        address_str = child_addr_detail["address"]
+                        # path_str = child_addr_detail["path"] # Path already in task object
 
-                        # Use APIHandler to get balance and existence
-                        # This is an I/O bound task
                         balance, has_funds, has_history = await self.api_handler.get_balance_and_existence(
-                            coin_type, address_str
+                            coin_type_enum, address_str
                         )
 
-                        all_address_details_for_log.append({
-                            "coin": coin_name_str,
-                            "address": address_str,
-                            "path": derivation_path,
-                            "balance": balance,
-                            "has_funds": has_funds,
-                            "has_on_chain_history": has_history
-                        })
+                        # Update the Task object with the results
+                        current_task_object.update_address_details(coin_name_str, address_str, balance, has_funds, has_history)
 
                         if has_funds:
                             found_any_balance_for_mnemonic = True
-                            # Log immediately to found.txt via main logger or specific method
-                            # This is handled by self.log_result if found_any_balance_for_mnemonic is true
 
-                # 3. Log the comprehensive result for the mnemonic
-                await self.log_result(
-                    current_processed_idx,
-                    mnemonic,
-                    all_address_details_for_log, # This is now a list of dicts
-                    found_any_balance_for_mnemonic,
-                    history_score if self.config.ENABLE_CLASSIFIER_SCORING else None
-                )
+                current_task_object.mark_as_completed()
+
+                # 3. Log the comprehensive result for the task
+                await self.log_result(current_task_object, found_any_balance_for_mnemonic, history_score if self.config.ENABLE_CLASSIFIER_SCORING else None)
 
                 # 4. Update counters
-                self.processed_mnemonic_index = current_processed_idx
+                self.processed_mnemonic_index = current_task_object.index # Use index from task
                 self.mnemonics_processed_in_session += 1
                 self.app_stats["mnemonics_checked_session"] = self.mnemonics_processed_in_session
 
@@ -685,37 +674,56 @@ class BalanceChecker:
                 if found_any_balance_for_mnemonic:
                     self.found_wallets_count_session += 1
                     self.app_stats["wallets_found_session"] = self.found_wallets_count_session
-                    # Update last_found_wallet_details for UI (simplified for now)
-                    self.app_stats["last_found_wallet_details"] = {
-                        "mnemonic": mnemonic,
-                        "details": all_address_details_for_log
-                    }
-
+                    self.app_stats["last_found_wallet_details"] = current_task_object.to_dict() # Log the full task object dict
 
             except asyncio.TimeoutError: # Expected if queue is empty
                 continue
             except asyncio.CancelledError:
                 logger.info(f"Worker {task_name} was cancelled.")
+                if current_task_object and current_task_object.status != "completed":
+                    current_task_object.mark_as_failed("Worker cancelled during processing")
+                    # Optionally log the failed task if needed for recovery
                 break
             except Exception as e:
-                mnemonic_str = mnemonic[:15] if mnemonic else "unknown_mnemonic"
-                logger.error(f"Error processing mnemonic {mnemonic_str}... : {e}", exc_info=True)
+                task_idx_str = str(current_task_object.index) if current_task_object else "unknown_task_index"
+                mnemonic_str = current_task_object.mnemonic_phrase[:15] if current_task_object else (mnemonic_phrase[:15] if mnemonic_phrase else "unknown_mnemonic")
+                logger.error(f"Error processing Task {task_idx_str} (mnemonic {mnemonic_str}...): {e}", exc_info=True)
                 self.app_stats["errors_encountered"] +=1
+                if current_task_object:
+                    current_task_object.mark_as_failed(str(e))
+                    # Log the failed task so its state is recorded
+                    await self.log_result(current_task_object, False, history_score if 'history_score' in locals() else None)
             finally:
-                if mnemonic is not None: # Check if mnemonic was successfully retrieved
+                if mnemonic_phrase is not None: # Check if mnemonic was successfully retrieved
                     self.async_mnemonic_queue.task_done()
         logger.info(f"Worker {task_name} stopping.")
 
-    async def log_result(self, index: int, mnemonic: str, address_details_list: list, found_balance: bool, history_score: float = None):
-        """Logs the detailed result for a mnemonic, including all checked child addresses."""
-        log_payload = {
-            "index": index,
-            "timestamp": datetime.now().isoformat(),
-            "mnemonic": mnemonic,
-            "addresses": address_details_list # List of dicts, one per child address
-        }
+    async def log_result(self, task: Task, found_balance: bool, history_score: float = None):
+        """Logs the detailed result for a Task object."""
+
+        log_payload = task.to_dict() # Use Task's own serialization method
+
+        # Determine the timestamp for the log entry
+        # The task.to_dict() already includes creation_time and completion_time.
+        # The 'timestamp' field in the log_payload should represent when this specific log event occurred.
+        # For consistency, we can override the 'timestamp' from task.to_dict() if it had one,
+        # or just add it if task.to_dict() doesn't produce a top-level 'timestamp'.
+        # Task.to_dict() does not add a 'timestamp' field itself, it has 'creation_time' and 'completion_time'.
+        # So, we are adding a new 'log_event_timestamp'.
+
+        if task.status in ["completed", "failed"] and task.completion_time:
+            # If task is finalized, use its completion time for the main log event timestamp.
+            log_payload["log_event_timestamp"] = task.completion_time.isoformat()
+        else:
+            # Otherwise, use current time (e.g. for partially processed tasks or if completion_time isn't set yet)
+            log_payload["log_event_timestamp"] = datetime.now().isoformat()
+
         if history_score is not None:
-            log_payload["history_score"] = round(history_score, 4)
+            log_payload["history_score"] = round(history_score, 4) # Add/overwrite if classifier was used
+
+        # Add overall_balance_found_for_mnemonic for clarity at the top level of the log
+        log_payload["overall_balance_found_for_mnemonic"] = found_balance
+
 
         log_message_json = json.dumps(log_payload)
 
