@@ -19,852 +19,1004 @@ import pstats # For processing cProfile stats
 import io # For capturing cProfile output to string
 import argparse # For command-line arguments
 
-# Import the new mnemonic generator
-# Modular imports from the previous refactoring (assuming they are now in place)
-import finder.config as config
-import finder.logger_setup as logger_setup
-from finder.mnemonic_generator import MnemonicGeneratorManager, save_current_index as save_generator_index, load_initial_index as load_generator_index
-from finder.dqn_agent import DQNAgent # Will be replaced for PPO where applicable
-from finder.ppo_sb3_agent import PPOAgentSB3 # Import the new PPO agent
+# Modular imports
+import finder.config as app_config
+import finder.logger_setup # For main_entry_point call
+from finder.mnemonic_generator import (
+    MnemonicGeneratorManager,
+    generate_addresses_with_paths, # Use this for address derivation
+    load_generator_index_from_file, # For loading processed index state
+    save_generator_index_to_file    # For saving processed index state
+)
+from finder.ppo_sb3_agent import PPOAgentSB3
 from finder.api_handler import APIHandler
+from finder.features import extract_mnemonic_features # extract_address_features is not used yet
 
 
-if getattr(sys, 'frozen', False):
-    # PyInstaller bundle path
-    base_path = sys._MEIPASS
-    os.environ["BIP39_WORDLISTS_PATH"] = os.path.join(base_path, "bip_utils", "bip", "bip39", "wordlist")
-
-# Setup main application logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(threadName)s - %(module)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-
-# Setup dedicated logger for results (checked.txt)
-results_logger = logging.getLogger('ResultsLogger')
-results_logger.setLevel(logging.INFO)
-results_logger.propagate = False  # Don't pass to root logger
-
-# Configure RotatingFileHandler for results_logger
-# Rotate when checked.txt reaches 10MB, keep 5 backup files
-# Ensure the 'finder' directory exists or specify full path if needed
-checked_file_path = "finder/checked.txt" # Ensure this path is correct
-os.makedirs(os.path.dirname(checked_file_path), exist_ok=True)
-
-checked_file_handler = RotatingFileHandler(
-    checked_file_path,
-    maxBytes=10 * 1024 * 1024,  # 10 MB
-    backupCount=5  # Number of backup files
-)
-checked_file_handler.setFormatter(logging.Formatter('%(message)s')) # Raw message format
-results_logger.addHandler(checked_file_handler)
-
-
-API_ENDPOINTS = {
-    Bip44Coins.BITCOIN: [
-        "https://blockchain.info/balance?active={address}",
-        "https://chain.api.btc.com/v3/address/{address}",
-    ],
-    Bip44Coins.ETHEREUM: [
-        "https://api.etherscan.io/api?module=account&action=balance&address={address}",
-        # "https://eth-mainnet.alchemyapi.io/v2/demo/balance?address={address}", # Often rate limited
-    ],
-    "USDT": [ # USDT on Ethereum (ERC20)
-        "https://api.etherscan.io/api?module=account&action=tokenbalance&contractaddress=0xdac17f958d2ee523a2206206994597c13d831ec7&address={address}&tag=latest",
-    ]
-}
-
-# Path for generator state file, ensure it's in a writable location
-GENERATOR_STATE_FILE = "finder/generator_state.txt" # Note: This is also defined in mnemonic_generator.py
-
-# DQN Related Constants
-DQN_RL_CYCLE_INTERVAL_SECONDS = 30  # Rate Limiter DQN
-DQN_WC_CYCLE_INTERVAL_SECONDS = 45  # Worker Count DQN (can be different)
-
-# Rate Limiter DQN
-RL_AGENT_STATE_SIZE = 4
-RL_AGENT_ACTION_SIZE = 3 # Decrease, Maintain, Increase rate
-MIN_RATE_LIMIT = 1.0
-MAX_RATE_LIMIT = 50.0 # Sensible maximum for public APIs
-RATE_ADJUSTMENT_STEP = 1.0
-
-# Worker Count DQN
-WC_AGENT_STATE_SIZE = 3 # current_workers_norm, queue_fill, avg_proc_time_norm (or throughput per worker)
-WC_AGENT_ACTION_SIZE = 3 # Decrease, Maintain, Increase workers
-MIN_PROCESSING_WORKERS = 1
-MAX_PROCESSING_WORKERS = (os.cpu_count() or 1) * 4 # Example max: 4x CPU cores
-WORKER_ADJUSTMENT_STEP = 1
+# Configure a logger for this module
+logger = logging.getLogger(__name__)
 
 
 class BalanceChecker:
-    def __init__(self):
-        self.session = None
-        self.executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
-        self.found_file = "finder/found.txt"
+    def __init__(self, cfg): # Pass config object
+        self.config = cfg
+        self.api_handler: APIHandler = None # Will be initialized in start()
+        self.executor = ThreadPoolExecutor(max_workers=self.config.APP_MAX_EXECUTOR_WORKERS)
 
-        # --- Rate Limiter Attributes ---
-        self.current_api_rate = 10.0
-        self.limiter = AsyncLimiter(self.current_api_rate, 1)
-        self.rl_agent_rate_limiter = DQNAgent(
-            state_size=RL_AGENT_STATE_SIZE, action_size=RL_AGENT_ACTION_SIZE,
-            agent_name="rate_limiter_agent", seed=42)
-        self.rl_previous_state = None
-        self.rl_previous_action = None
-        self.api_calls_total_since_last_rl_cycle = 0
-        self.api_errors_429_since_last_rl_cycle = 0
-        self.api_timeouts_since_last_rl_cycle = 0
-        self.last_rl_cycle_time = time.time()
+        # --- Rate Limiter Agent (PPO) ---
+        if self.config.ENABLE_RL_AGENT_RATE_LIMITER:
+            self.rl_agent_rate_limiter = PPOAgentSB3(
+                state_dim=self.config.RL_AGENT_STATE_SIZE,
+                action_dim=self.config.RL_AGENT_ACTION_SIZE,
+                lr=self.config.PPO_LR_RATE_LIMITER,
+                gamma=self.config.PPO_GAMMA_RATE_LIMITER,
+                agent_name=self.config.RL_AGENT_NAME,
+                models_dir=self.config.MODELS_DIR,
+                log_dir=self.config.LOG_DIR_PPO_RATE_LIMITER,
+                seed=self.config.SEED_RL_AGENT_RATE_LIMITER
+            )
+            logger.info("PPO Rate Limiter Agent enabled and initialized.")
+        else:
+            self.rl_agent_rate_limiter = None
+            logger.info("PPO Rate Limiter Agent disabled.")
+        self.current_api_rate = self.config.INITIAL_OVERALL_API_RATE # Initial rate
+        self.limiter = AsyncLimiter(self.current_api_rate, 1) # Will be updated by PPO
 
-        # --- Worker Count Attributes ---
-        self.current_num_processing_workers = (os.cpu_count() or 1) * 2
+        # --- Worker Count Agent (PPO) ---
+        if self.config.ENABLE_RL_AGENT_WORKER_COUNT:
+            self.wc_agent_worker_count = PPOAgentSB3(
+                state_dim=self.config.WC_AGENT_STATE_SIZE,
+                action_dim=self.config.WC_AGENT_ACTION_SIZE,
+                lr=self.config.PPO_LR_WORKER_COUNT,
+                gamma=self.config.PPO_GAMMA_WORKER_COUNT,
+                agent_name=self.config.WC_AGENT_NAME,
+                models_dir=self.config.MODELS_DIR,
+                log_dir=self.config.LOG_DIR_PPO_WORKER_COUNT,
+                seed=self.config.SEED_RL_AGENT_WORKER_COUNT
+            )
+            logger.info("PPO Worker Count Agent enabled and initialized.")
+        else:
+            self.wc_agent_worker_count = None
+            logger.info("PPO Worker Count Agent disabled.")
+        self.current_num_processing_workers = self.config.INITIAL_PROCESSING_WORKERS
         self.processing_worker_tasks = []
-        self.wc_agent_worker_count = DQNAgent(
-            state_size=WC_AGENT_STATE_SIZE, action_size=WC_AGENT_ACTION_SIZE,
-            agent_name="worker_count_agent", seed=123)
-        self.wc_previous_state = None
-        self.wc_previous_action = None
-        self.mnemonics_processed_last_wc_cycle = 0
-        self.last_wc_cycle_time = time.time() # Corrected variable name
-
-        # --- API Endpoint Stats ---
-        self.api_endpoint_stats = {} # {coin_type: {url_template: {stats}}}
-        self._initialize_api_endpoint_stats()
-        self.api_stats_log_interval = 600 # Log API stats every 10 minutes
-        self.last_api_stats_log_time = time.time()
 
         # --- Common Attributes ---
-        self.async_mnemonic_queue = asyncio.Queue(maxsize=10000)
-        self.coins = [Bip44Coins.BITCOIN, Bip44Coins.ETHEREUM, "USDT"]
-        self.processed_mnemonic_index = load_generator_index()
+        self.async_mnemonic_queue = asyncio.Queue(maxsize=self.config.ASYNC_MNEMONIC_QUEUE_SIZE)
+        self.coins_to_check = self.config.COINS_TO_CHECK # List of Bip44Coins enums
+
+        self.processed_mnemonic_index = 0 # Initialized from state file in start()
         self.mnemonics_processed_in_session = 0
-        self.mp_queue = multiprocessing.Queue(maxsize=10000)
-        self.mnemonic_generator_manager = MnemonicGeneratorManager(output_queue=self.mp_queue)
+
+        # Multiprocessing queue for receiving mnemonics from workers
+        self.mp_mnemonic_input_queue = multiprocessing.Queue(maxsize=self.config.MP_MNEMONIC_QUEUE_SIZE)
+        self.mnemonic_generator_manager = MnemonicGeneratorManager( # Manager from mnemonic_generator.py
+            config=self.config,
+            num_workers=self.config.MNEMONIC_GENERATOR_WORKERS,
+            # load_state=True here means MnemonicGeneratorManager loads its *raw* generation index.
+            # BalanceChecker loads its *processed* index separately.
+            load_state=True
+        )
         self._stop_event = asyncio.Event()
+        self._pause_event = asyncio.Event() # For pause/resume functionality
+        self._pause_event.set() # Start in unpaused state (event is clear = paused)
 
+        # --- Classifier Model ---
+        self.classifier_history_model = None
+        if self.config.ENABLE_CLASSIFIER_SCORING:
+            try:
+                import joblib # Lazy import for classifier dependency
+                model_path = self.config.CLASSIFIER_MODEL_HISTORY_PATH
+                if os.path.exists(model_path):
+                    self.classifier_history_model = joblib.load(model_path)
+                    logger.info(f"History classifier model loaded from {model_path}")
+                else:
+                    logger.warning(f"History classifier model not found at {model_path}. Scoring will be disabled.")
+                    self.config.ENABLE_CLASSIFIER_SCORING = False
+            except Exception as e:
+                logger.error(f"Failed to load history classifier model: {e}", exc_info=True)
+                self.config.ENABLE_CLASSIFIER_SCORING = False
 
-    def _initialize_api_endpoint_stats(self):
-        for coin_type, endpoints in API_ENDPOINTS.items():
-            self.api_endpoint_stats[coin_type] = {}
-            for endpoint_url_template in endpoints:
-                self.api_endpoint_stats[coin_type][endpoint_url_template] = {
-                    "successes": 0,
-                    "failures": 0, # General failures (non-200, parse errors)
-                    "timeouts": 0,
-                    "errors_429": 0, # Specific for rate limits
-                    "total_latency_ms": 0, # Sum of latencies for successful calls
-                    "latency_count": 0,    # Number of calls included in total_latency_ms
-                    "score": 100.0 # Initial optimistic score
-                }
-        logging.info("API endpoint stats initialized.")
-
-    async def _update_api_call_stats(self, status_code=None, is_timeout=False):
-        # This function is for the Rate Limiter DQN's perspective
-        self.api_calls_total_since_last_rl_cycle += 1
-        if status_code == 429:
-            self.api_errors_429_since_last_rl_cycle += 1
-        if is_timeout: # This is timeout from the perspective of the limiter DQN
-            self.api_timeouts_since_last_rl_cycle +=1
-
-    async def _update_specific_endpoint_stats(self, coin_type, url_template, success, is_timeout, is_429, latency_ms=0):
-        """Updates stats for a specific endpoint after an API call."""
-        if coin_type not in self.api_endpoint_stats or \
-           url_template not in self.api_endpoint_stats[coin_type]:
-            logging.warning(f"Attempted to update stats for unknown endpoint: {coin_type} - {url_template}")
-            return
-
-        stats = self.api_endpoint_stats[coin_type][url_template]
-        if success:
-            stats["successes"] += 1
-            stats["total_latency_ms"] += latency_ms
-            stats["latency_count"] += 1
-        else:
-            stats["failures"] += 1
-            if is_timeout:
-                stats["timeouts"] += 1
-            if is_429:
-                stats["errors_429"] += 1
-
-        # Simple scoring: +1 for success, -2 for failure/timeout, -5 for 429
-        # More sophisticated scoring can be added later.
-        score_change = 0
-        if success: score_change = 1
-        else: score_change = -2
-        if is_429: score_change = -5 # Heavier penalty for being rate-limited by this specific endpoint
-
-        stats["score"] = max(0, stats["score"] + score_change) # Score doesn't go below 0
-
-    async def _log_api_endpoint_stats_periodically(self):
-        """Periodically logs the collected API endpoint statistics."""
-        if (time.time() - self.last_api_stats_log_time) > self.api_stats_log_interval:
-            logging.info("--- API Endpoint Statistics ---")
-            for coin_type, endpoints_data in self.api_endpoint_stats.items():
-                logging.info(f"Coin: {coin_type}")
-                # Sort endpoints by score descending for readability
-                sorted_endpoints = sorted(endpoints_data.items(), key=lambda item: item[1]["score"], reverse=True)
-                for url_template, stats in sorted_endpoints:
-                    avg_latency = (stats['total_latency_ms'] / stats['latency_count']) if stats['latency_count'] > 0 else 0
-                    logging.info(
-                        f"  URL: {url_template} | Score: {stats['score']:.1f} | "
-                        f"S: {stats['successes']}, F: {stats['failures']}, T: {stats['timeouts']}, 429: {stats['errors_429']} | "
-                        f"Avg Latency: {avg_latency:.0f}ms"
-                    )
-            logging.info("--- End API Endpoint Statistics ---")
-            self.last_api_stats_log_time = time.time()
+        # --- Web Server Attributes ---
+        self.websocket_message_queue = asyncio.Queue(maxsize=100) # For sending updates to UI
+        self.app_stats = { # For UI display
+            "mnemonics_checked_session": 0,
+            "mnemonics_per_second_session": 0,
+            "total_mnemonics_checked_all_time": 0,
+            "wallets_found_session": 0,
+            "current_api_rate_limit": self.current_api_rate,
+            "active_processing_workers": self.current_num_processing_workers,
+            "input_queue_size": 0,
+            "output_queue_size": 0, # Not directly used, but async_mnemonic_queue.qsize()
+            "proxy_enabled": self.config.ENABLE_PROXY,
+            "proxy_url": self.config.PROXY_URL if self.config.ENABLE_PROXY else "N/A",
+            "status": "Initializing", # Initializing, Running, Paused, Stopping, Stopped
+            "last_found_wallet_details": None, # Store details of the last found wallet
+            "errors_encountered": 0,
+            "api_429_errors_total": 0, # From APIHandler
+            "api_timeout_errors_total": 0, # From APIHandler
+            "api_other_errors_total": 0, # From APIHandler
+        }
+        self.session_start_time = time.time()
+        self.found_wallets_count_session = 0
 
 
     async def _mp_to_asyncio_queue_adapter(self):
-        logging.info("Starting multiprocessing to asyncio queue adapter.")
+        logger.info("Starting multiprocessing to asyncio queue adapter.")
         loop = asyncio.get_running_loop()
+        temp_mnemonic_list = [] # Buffer for batch put
         while not self._stop_event.is_set():
+            await self._pause_event.wait() # Respect pause signal
             try:
-                # Use run_in_executor to get from mp.Queue without blocking asyncio loop
-                mnemonic_phrase = await loop.run_in_executor(self.executor, self.mp_queue.get, True, 0.1) # Timeout 0.1s
-                if mnemonic_phrase:
-                    await self.async_mnemonic_queue.put(mnemonic_phrase)
+                # Batch get from mp.Queue if possible, or single get
+                # For simplicity, using single get with timeout in executor
+                mnemonic_data = await loop.run_in_executor(self.executor, self.mp_queue.get, True, 0.1) # Timeout 0.1s
+                if mnemonic_data: # Expecting (index, mnemonic_phrase) from new generator
+                    # The new MnemonicGeneratorManager from mnemonic_generator.py puts (index, phrase)
+                    # but the one in this app.py was modified to put just phrase.
+                    # Let's assume the external one puts (index, phrase) and we use the phrase.
+                    # If it's just phrase, then current_index logic in process_queue needs care.
+                    # For now, assuming mnemonic_data is just the phrase as per current MnemonicGeneratorManager in app.py.
+
+                    # If MnemonicGeneratorManager from finder.mnemonic_generator.py is used,
+                    # it puts (index, phrase). We should use that index.
+                    # Let's switch to that assumption, as it's more robust.
+                    # current_idx, mnemonic_phrase = mnemonic_data # If (idx, phrase)
+                    # For now, this BalanceChecker assumes its own MnemonicGeneratorManager from app.py
+                    # which puts only the phrase. So self.processed_mnemonic_index is managed here.
+
+                    # Reconciling with `finder.mnemonic_generator.MnemonicGeneratorManager`:
+                    # That manager is simpler and its workers put only `mnemonic_phrase`.
+                    # So, this adapter is fine as is, `BalanceChecker` manages the overall index.
+                    await self.async_mnemonic_queue.put(mnemonic_data) # mnemonic_data is just the phrase
+
             except multiprocessing.queues.Empty: # Expected on timeout
                 continue
             except Exception as e:
-                logging.error(f"Error in mp_to_asyncio_queue_adapter: {e}")
+                logger.error(f"Error in mp_to_asyncio_queue_adapter: {e}", exc_info=True)
                 await asyncio.sleep(0.1) # Avoid busy loop on error
-        logging.info("Multiprocessing to asyncio queue adapter stopped.")
+        logger.info("Multiprocessing to asyncio queue adapter stopped.")
+
+    async def _handle_api_stats_for_rl(self, status_code, is_timeout, is_429, is_other_failure):
+        """Callback for APIHandler to update RL-relevant stats."""
+        if self.rl_agent_rate_limiter: # Only if agent is enabled
+            self.rl_agent_rate_limiter.increment_api_calls() # Assuming PPOAgent has such a method
+            if is_429: self.rl_agent_rate_limiter.increment_429_errors()
+            if is_timeout: self.rl_agent_rate_limiter.increment_timeout_errors()
+            # Update app_stats for UI
+            if is_429: self.app_stats["api_429_errors_total"] +=1
+            if is_timeout: self.app_stats["api_timeout_errors_total"] +=1
+            if is_other_failure and not is_429 and not is_timeout:
+                self.app_stats["api_other_errors_total"] +=1
 
 
-    async def start(self):
-        self.session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit_per_host=5), # Be kinder to APIs
-            headers={"User-Agent": "Mozilla/5.0"} # Standard User-Agent
+    async def start(self, args): # Pass command line args
+        logger.info("Initializing BalanceChecker...")
+        self.app_stats["status"] = "Initializing"
+        self.update_websocket_message_queue() # Initial status update
+
+        # Load initial *processed* mnemonic index from app's state file
+        self.processed_mnemonic_index = load_generator_index_from_file(self.config.GENERATOR_STATE_FILE_APP)
+        self.app_stats["total_mnemonics_checked_all_time"] = self.processed_mnemonic_index
+        logger.info(f"Loaded initial processed mnemonic index: {self.processed_mnemonic_index} from {self.config.GENERATOR_STATE_FILE_APP}")
+
+        # Initialize APIHandler with aiohttp.ClientSession
+        # The session should be created here and passed to APIHandler
+        # Proxy configuration should be handled by APIHandler based on config
+        connector_settings = {'limit_per_host': self.config.TCP_CONNECTOR_LIMIT_PER_HOST}
+        if self.config.ENABLE_PROXY and self.config.PROXY_URL:
+            logger.info(f"Proxy enabled, using: {self.config.PROXY_URL}")
+            # Proxy will be passed to session.get by APIHandler
+        else:
+            logger.info("Proxy disabled.")
+
+        # Initialize aiohttp.ClientSession here to be managed by BalanceChecker
+        self.client_session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(**connector_settings),
+            headers={"User-Agent": self.config.DEFAULT_USER_AGENT}
         )
 
-        # Start the Python-based mnemonic generator manager
-        self.mnemonic_generator_manager.start()
-        adapter_task = asyncio.create_task(self._mp_to_asyncio_queue_adapter())
+        self.api_handler = APIHandler(
+            config_obj=self.config, # Pass full config object
+            session=self.client_session, # Pass the session
+            limiter=self.limiter, # Pass the rate limiter to be used by APIHandler's _make_api_request
+                                  # APIHandler will use this limiter internally.
+            stats_callback=self._handle_api_stats_for_rl # Callback for RL agent
+        )
+        # The APIHandler itself will manage its internal session if not provided one,
+        # but better to provide one for centralized lifecycle management.
+        # The APIHandler's init_session will be called implicitly or explicitly.
+        # Let's assume APIHandler uses the provided session.
+        # No, APIHandler creates its own session if one isn't passed.
+        # If we want APIHandler to use *this* session, it needs to accept it.
+        # And APIHandler's overall_limiter is distinct from self.limiter here.
+        # This needs careful thought.
+        # For PPO, the self.limiter rate is what the PPO agent controls.
+        # APIHandler should use *that* limiter.
 
-        # Initialize processing workers
+        # Revised APIHandler integration:
+        # BalanceChecker creates and manages the aiohttp.ClientSession.
+        # BalanceChecker creates and manages the AsyncLimiter (self.limiter) whose rate is PPO controlled.
+        # APIHandler is instantiated with this session and this limiter.
+        # This seems cleaner. APIHandler's internal limiter becomes unused if one is passed.
+
+        # Start the MnemonicGeneratorManager (from finder.mnemonic_generator.py)
+        # It manages its own raw generation index. We pass it the queue it should use.
+        self.mnemonic_generator_manager.start_generation(output_queue=self.mp_mnemonic_input_queue)
+
+        adapter_task = asyncio.create_task(self._mp_to_asyncio_queue_adapter(self.mp_mnemonic_input_queue))
+
+        # Initialize processing workers (coroutines)
         self.processing_worker_tasks = []
-        for _ in range(self.current_num_processing_workers):
+        for _ in range(self.current_num_processing_workers): # Use initial worker count from config
             task = asyncio.create_task(self.process_queue())
             self.processing_worker_tasks.append(task)
-        logging.info(f"Starting with {self.current_num_processing_workers} processing workers.")
+        logger.info(f"Starting with {self.current_num_processing_workers} processing workers.")
+        self.app_stats["active_processing_workers"] = self.current_num_processing_workers
 
-        # Start DQN control loops
-        dqn_rl_control_task = asyncio.create_task(self._dqn_control_loop_rate_limiter())
-        dqn_wc_control_task = asyncio.create_task(self._dqn_control_loop_worker_count())
+        # Start PPO control loops if enabled
+        control_loop_tasks = []
+        if self.rl_agent_rate_limiter:
+            control_loop_tasks.append(asyncio.create_task(self._ppo_control_loop_rate_limiter()))
+        if self.wc_agent_worker_count:
+            control_loop_tasks.append(asyncio.create_task(self._ppo_control_loop_worker_count()))
 
-        # Consolidate all main tasks to await their completion
-        # Note: self.processing_worker_tasks are managed (added/removed) dynamically by DQN
-        # So, they are not directly awaited in the main gather like fixed tasks.
-        # Instead, their lifecycle is tied to _stop_event and cancellations by DQN.
-        # The main gather awaits tasks that run for the lifetime of the app.
-        core_tasks = [adapter_task, dqn_rl_control_task, dqn_wc_control_task]
+        # Start periodic stats update task
+        stats_update_task = asyncio.create_task(self._periodic_stats_updater())
+
+        # Start web server task
+        web_server_task = asyncio.create_task(self.run_web_server())
+
+        core_tasks = [adapter_task, stats_update_task, web_server_task] + control_loop_tasks
+        self.app_stats["status"] = "Running"
+        self.update_websocket_message_queue()
 
         try:
-            # We also need to await the initial set of worker tasks,
-            # or handle their completion/cancellation within the shutdown logic.
-            # For now, let's add them to the gather, but dynamic adjustment needs care.
-            # This might be problematic if workers are frequently added/removed.
-            # A better approach for workers might be to manage them outside the main gather,
-            # and ensure they are all stopped during the finally block.
-            # For now, let's gather all tasks that are initially started.
-
-            await asyncio.gather(*(core_tasks + self.processing_worker_tasks))
-
+            await asyncio.gather(*core_tasks) # Removed self.processing_worker_tasks from main gather
+                                            # as they are managed by PPO agent / shutdown logic
         except KeyboardInterrupt:
-            logging.info("Keyboard interrupt received, shutting down BalanceChecker...")
+            logger.info("Keyboard interrupt received, shutting down BalanceChecker...")
         except Exception as e:
-            logging.critical(f"Critical error in BalanceChecker main gather: {e}", exc_info=True)
+            logger.critical(f"Critical error in BalanceChecker main gather: {e}", exc_info=True)
+            self.app_stats["errors_encountered"] +=1
         finally:
-            logging.info("BalanceChecker shutting down gracefully...")
-            self._stop_event.set() # This should signal all loops and workers to stop
+            logger.info("BalanceChecker shutting down gracefully...")
+            self.app_stats["status"] = "Stopping"
+            self.update_websocket_message_queue()
+            self._stop_event.set()
+            self._pause_event.set() # Ensure it's unpaused for shutdown tasks
 
-            self.mnemonic_generator_manager.shutdown()
+            # Shutdown MnemonicGeneratorManager (from finder.mnemonic_generator.py)
+            self.mnemonic_generator_manager.stop_generation()
 
-            # Cancel all processing worker tasks explicitly
-            logging.info(f"Cancelling {len(self.processing_worker_tasks)} processing workers...")
+            # Cancel all processing worker tasks explicitly (these are BalanceChecker's workers)
+            logger.info(f"Cancelling {len(self.processing_worker_tasks)} processing workers...")
             for task in self.processing_worker_tasks:
-                if not task.done():
-                    task.cancel()
-            # Await their cancellation
+                if not task.done(): task.cancel()
             await asyncio.gather(*self.processing_worker_tasks, return_exceptions=True)
-            logging.info("Processing workers shut down.")
+            logger.info("Processing workers shut down.")
 
-            # Wait for core tasks (adapter, DQN loops) with a timeout
-            # These tasks should respond to _stop_event
-            done, pending = await asyncio.wait(core_tasks, timeout=DQN_RL_CYCLE_INTERVAL_SECONDS + 5.0) # Ensure DQN has time for one last save
+            # Wait for core tasks with a timeout
+            # PPO loops should handle _stop_event and save models if needed within their loop or on exit
+            # Let's ensure PPO agents save their models here explicitly if not in their loop.
+            done, pending = await asyncio.wait(core_tasks, timeout=max(self.config.RL_CYCLE_INTERVAL_SECONDS, self.config.WC_CYCLE_INTERVAL_SECONDS) + 10.0)
             for task in pending:
-                task_name = task.get_name() if hasattr(task, 'get_name') else "Unknown Core Task"
-                logging.warning(f"Core task {task_name} did not finish in time, cancelling.")
+                task_name = getattr(task, 'get_name', lambda: "Unknown Core Task")()
+                logger.warning(f"Core task {task_name} did not finish in time, cancelling.")
                 task.cancel()
-            if pending:
-                 await asyncio.gather(*pending, return_exceptions=True)
+            if pending: await asyncio.gather(*pending, return_exceptions=True)
 
-            if self.session:
-                await self.session.close()
-                logging.info("aiohttp session closed.")
+            if self.api_handler and self.api_handler.session: # Close session used by APIHandler
+                await self.api_handler.session.close() # APIHandler needs a close_session method or direct access
+                logger.info("APIHandler's aiohttp session closed.")
+            elif self.client_session: # If APIHandler used our session
+                 await self.client_session.close()
+                 logger.info("BalanceChecker's main aiohttp session closed.")
 
-            # Save DQN agent models
-            try:
-                self.rl_agent_rate_limiter.save_model()
-                self.wc_agent_worker_count.save_model()
-                logging.info("DQN agent models saved.")
-            except Exception as e:
-                logging.error(f"Failed to save one or more DQN agent models: {e}")
+            # Save PPO agent models if they are enabled
+            if self.rl_agent_rate_limiter: self.rl_agent_rate_limiter.save_model()
+            if self.wc_agent_worker_count: self.wc_agent_worker_count.save_model()
+            logger.info("PPO agent models saved (if enabled).")
 
-            if self.executor: # Shutdown executor after all tasks that might use it are done
+            if self.executor:
                 self.executor.shutdown(wait=True)
-                logging.info("ThreadPoolExecutor shut down.")
+                logger.info("ThreadPoolExecutor shut down.")
 
-            save_generator_index(self.processed_mnemonic_index)
-            logging.info(f"Saved generator state. Last processed index: {self.processed_mnemonic_index}")
-            logging.info(f"Mnemonics processed this session: {self.mnemonics_processed_in_session}")
+            save_generator_index_to_file(self.processed_mnemonic_index, self.config.GENERATOR_STATE_FILE_APP)
+            logger.info(f"Saved processed generator state. Last processed index: {self.processed_mnemonic_index} to {self.config.GENERATOR_STATE_FILE_APP}")
+            logger.info(f"Mnemonics processed this session: {self.mnemonics_processed_in_session}")
+            logger.info(f"Wallets with balance found this session: {self.found_wallets_count_session}")
+            self.app_stats["status"] = "Stopped"
+            self.update_websocket_message_queue() # Final status update
 
-    # --- DQN Rate Limiter Methods ---
-    def _get_rate_limiter_state_rl(self) -> np.ndarray:
+    # --- PPO Rate Limiter Methods ---
+    def _get_rate_limiter_state_ppo(self) -> np.ndarray:
         # Normalize current rate
-        norm_current_rate = (self.current_api_rate - MIN_RATE_LIMIT) / (MAX_RATE_LIMIT - MIN_RATE_LIMIT)
+        norm_current_rate = (self.current_api_rate - self.config.RL_MIN_RATE_LIMIT) / \
+                            (self.config.RL_MAX_RATE_LIMIT - self.config.RL_MIN_RATE_LIMIT)
         norm_current_rate = np.clip(norm_current_rate, 0, 1)
 
-        # Calculate error rates (since last RL cycle)
-        if self.api_calls_total_since_last_rl_cycle > 0:
-            error_rate_429 = self.api_errors_429_since_last_rl_cycle / self.api_calls_total_since_last_rl_cycle
-            timeout_rate = self.api_timeouts_since_last_rl_cycle / self.api_calls_total_since_last_rl_cycle
-        else:
-            error_rate_429 = 0.0
-            timeout_rate = 0.0
+        # Get error rates from the agent itself (which should be updated by APIHandler callback)
+        error_rate_429 = self.rl_agent_rate_limiter.get_429_rate() if self.rl_agent_rate_limiter else 0.0
+        timeout_rate = self.rl_agent_rate_limiter.get_timeout_rate() if self.rl_agent_rate_limiter else 0.0
 
-        # Queue fill percentage
-        queue_fill = self.async_mnemonic_queue.qsize() / self.async_mnemonic_queue.maxsize if self.async_mnemonic_queue.maxsize > 0 else 0.0
+        queue_fill = self.async_mnemonic_queue.qsize() / self.config.ASYNC_MNEMONIC_QUEUE_SIZE \
+            if self.config.ASYNC_MNEMONIC_QUEUE_SIZE > 0 else 0.0
 
-        state = np.array([
-            norm_current_rate,
-            error_rate_429,
-            timeout_rate,
-            queue_fill
-        ], dtype=np.float32)
+        state = np.array([norm_current_rate, error_rate_429, timeout_rate, queue_fill], dtype=np.float32)
         return state
 
-    def _apply_rate_limiter_action_rl(self, action: int):
-        """ Applies the action chosen by the DQN agent to the rate limiter. """
+    def _apply_rate_limiter_action_ppo(self, action: int):
         previous_rate = self.current_api_rate
-        if action == 0: # Decrease rate
-            self.current_api_rate = max(MIN_RATE_LIMIT, self.current_api_rate - RATE_ADJUSTMENT_STEP)
-        elif action == 1: # Maintain rate
-            pass
-        elif action == 2: # Increase rate
-            self.current_api_rate = min(MAX_RATE_LIMIT, self.current_api_rate + RATE_ADJUSTMENT_STEP)
+        # Action mapping: 0 = decrease, 1 = maintain, 2 = increase
+        if action == 0:
+            self.current_api_rate = max(self.config.RL_MIN_RATE_LIMIT, self.current_api_rate - self.config.RL_RATE_ADJUSTMENT_STEP)
+        elif action == 2:
+            self.current_api_rate = min(self.config.RL_MAX_RATE_LIMIT, self.current_api_rate + self.config.RL_RATE_ADJUSTMENT_STEP)
+        # action == 1 means maintain, so no change.
 
-        if self.current_api_rate != previous_rate:
-            self.limiter = AsyncLimiter(self.current_api_rate, 1) # Re-initialize limiter with new rate
-            logging.info(f"RL Agent adjusted API rate from {previous_rate:.2f} to {self.current_api_rate:.2f} rps.")
+        if abs(self.current_api_rate - previous_rate) > 1e-5 : # If rate actually changed
+            self.limiter = AsyncLimiter(self.current_api_rate, 1) # Re-initialize limiter
+            logger.info(f"PPO RL Agent adjusted API rate from {previous_rate:.2f} to {self.current_api_rate:.2f} rps.")
+            self.app_stats["current_api_rate_limit"] = self.current_api_rate
         else:
-            logging.info(f"RL Agent decided to maintain API rate at {self.current_api_rate:.2f} rps.")
-        return self.current_api_rate # Return new rate for logging or confirmation
+            logger.info(f"PPO RL Agent decided to maintain API rate at {self.current_api_rate:.2f} rps.")
 
-    def _calculate_rate_limiter_reward_rl(self, time_delta_seconds: float) -> float:
-        """ Calculates reward for the rate limiter agent. """
-        mnemonics_in_cycle = self.mnemonics_processed_in_session - self.mnemonics_processed_last_rl_cycle
+    def _calculate_rate_limiter_reward_ppo(self, time_delta_seconds: float, previous_action: int) -> float:
+        # Throughput: mnemonics processed by BalanceChecker workers
+        # This needs to be tracked correctly per cycle for PPO agent.
+        # Assume PPOAgentSB3 handles its own mnemonic count or we pass it.
+        # Let's use self.rl_agent_rate_limiter.get_processed_count_cycle()
 
-        throughput = mnemonics_in_cycle / time_delta_seconds if time_delta_seconds > 0 else 0.0
+        processed_count_cycle = self.rl_agent_rate_limiter.get_and_reset_processed_count_cycle() # Agent tracks this
+        throughput = processed_count_cycle / time_delta_seconds if time_delta_seconds > 0 else 0.0
 
-        # Penalties should be negative
-        penalty_429 = -50.0 * self.api_errors_429_since_last_rl_cycle  # Heavy penalty for 429s
-        penalty_timeout = -10.0 * self.api_timeouts_since_last_rl_cycle # Moderate penalty for timeouts
+        error_429_count_cycle = self.rl_agent_rate_limiter.get_and_reset_429_errors_cycle()
+        timeout_count_cycle = self.rl_agent_rate_limiter.get_and_reset_timeout_errors_cycle()
 
-        # Reward for throughput, scaled (e.g., aim for 10 processed/sec as a baseline reward of 1)
-        throughput_reward = throughput * 0.1
+        penalty_429 = self.config.RL_PENALTY_429 * error_429_count_cycle
+        penalty_timeout = self.config.RL_PENALTY_TIMEOUT * timeout_count_cycle
 
-        # Queue status consideration (small penalty for near-empty queue if trying to speed up)
+        throughput_reward = throughput * self.config.RL_REWARD_THROUGHPUT_SCALAR
+
         queue_penalty = 0.0
-        queue_fill = self.async_mnemonic_queue.qsize() / self.async_mnemonic_queue.maxsize if self.async_mnemonic_queue.maxsize > 0 else 0
-        if queue_fill < 0.1 and self.rl_previous_action == 2 : # If tried to increase rate with empty queue
-             queue_penalty = -0.5
-        if queue_fill > 0.95 : # Penalize nearly full queue
-             queue_penalty = -1.0
-
+        queue_fill = self.async_mnemonic_queue.qsize() / self.config.ASYNC_MNEMONIC_QUEUE_SIZE if self.config.ASYNC_MNEMONIC_QUEUE_SIZE > 0 else 0.0
+        if queue_fill < self.config.RL_QUEUE_LOW_THRESHOLD_PENALTY and previous_action == 2: # Increased rate with empty queue
+             queue_penalty = self.config.RL_PENALTY_QUEUE_LOW_ON_INCREASE
+        if queue_fill > self.config.RL_QUEUE_HIGH_THRESHOLD_PENALTY: # Penalize nearly full queue
+             queue_penalty = self.config.RL_PENALTY_QUEUE_HIGH
 
         reward = throughput_reward + penalty_429 + penalty_timeout + queue_penalty
-        logging.debug(f"RL Reward Calc: Throughput={throughput:.2f} ({throughput_reward:.2f}), "
-                     f"429s={self.api_errors_429_since_last_rl_cycle} ({penalty_429:.2f}), "
-                     f"Timeouts={self.api_timeouts_since_last_rl_cycle} ({penalty_timeout:.2f}), "
-                     f"QueuePen={queue_penalty:.2f}. Total Reward: {reward:.2f}")
+        logger.debug(f"PPO RL Reward: Throughput={throughput:.2f} ({throughput_reward:.2f}), "
+                     f"429s={error_429_count_cycle} ({penalty_429:.2f}), "
+                     f"Timeouts={timeout_count_cycle} ({penalty_timeout:.2f}), "
+                     f"QueuePen={queue_penalty:.2f}. Total: {reward:.2f}")
         return float(reward)
 
-    async def _dqn_control_loop_rate_limiter(self):
-        logging.info("DQN Rate Limiter control loop started.")
-        await asyncio.sleep(DQN_CYCLE_INTERVAL_SECONDS) # Initial delay before first action
+    async def _ppo_control_loop_rate_limiter(self):
+        logger.info("PPO Rate Limiter control loop started.")
+        await asyncio.sleep(self.config.RL_CYCLE_INTERVAL_SECONDS)
+
+        last_cycle_time = time.time()
+
+        # PPO often collects a rollout (sequence of experiences) before learning.
+        # For simplicity here, we might do a learn step every cycle, which is more like A2C/A3C.
+        # Or, PPOAgentSB3 handles its own n_steps internally for rollout collection.
 
         while not self._stop_event.is_set():
+            await self._pause_event.wait() # Respect pause
             loop_start_time = time.time()
+            try:
+                current_state = self._get_rate_limiter_state_ppo()
+                action, _states = self.rl_agent_rate_limiter.predict(current_state, deterministic=not self.config.PPO_TRAIN_MODE)
 
-            # 1. Get current state
-            current_state = self._get_rate_limiter_state_rl()
+                self._apply_rate_limiter_action_ppo(action)
 
-            # 2. If there was a previous state/action, calculate reward and learn
-            if self.rl_previous_state is not None and self.rl_previous_action is not None:
-                time_delta = loop_start_time - self.last_rl_cycle_time
-                reward = self._calculate_rate_limiter_reward_rl(time_delta)
+                # Wait for the cycle duration to collect experience
+                # This sleep should ideally be adjusted if the above steps take significant time
+                # For now, fixed sleep assuming agent steps are fast.
+                await asyncio.sleep(self.config.RL_CYCLE_INTERVAL_SECONDS) # Target cycle interval
 
-                # Run learning step in executor
-                # done flag is False as this is a continuous task
-                await asyncio.get_running_loop().run_in_executor(
-                    self.executor,
-                    self.rl_agent_rate_limiter.step,
-                    self.rl_previous_state,
-                    self.rl_previous_action,
-                    reward,
-                    current_state, # This is next_state from perspective of previous action
-                    False
-                )
-                logging.debug(f"RL Agent learning step completed. Reward: {reward:.3f}, Epsilon: {self.rl_agent_rate_limiter.eps:.3f}")
+                if self.config.PPO_TRAIN_MODE:
+                    time_delta = time.time() - loop_start_time # Actual time passed in cycle
+                    reward = self._calculate_rate_limiter_reward_ppo(time_delta, action)
+                    next_state = self._get_rate_limiter_state_ppo()
+                    done = self._stop_event.is_set()
 
+                    self.rl_agent_rate_limiter.record_experience(current_state, action, reward, next_state, done)
+                    await asyncio.get_running_loop().run_in_executor(self.executor, self.rl_agent_rate_limiter.train_on_collected_rollout)
+            except Exception as e:
+                logger.error(f"Error in PPO Rate Limiter control loop: {e}", exc_info=True)
+                # Optional: Implement a cooldown or skip a cycle on error to prevent rapid error loops
+                await asyncio.sleep(self.config.RL_CYCLE_INTERVAL_SECONDS) # Ensure we still wait out the cycle
 
-            # 3. Agent selects an action based on current state
-            # Run action selection in executor as it involves model inference
-            action = await asyncio.get_running_loop().run_in_executor(
-                self.executor,
-                self.rl_agent_rate_limiter.get_action,
-                current_state
-            )
+            last_cycle_time = time.time()
 
-            # 4. Apply action
-            self._apply_rate_limiter_action_rl(action) # This updates self.limiter
+        logger.info("PPO Rate Limiter control loop stopped.")
 
-            # 5. Store current state and action for next iteration's learning step
-            self.rl_previous_state = current_state
-            self.rl_previous_action = action
-
-            # Reset counters for the next cycle
-            self.mnemonics_processed_last_rl_cycle = self.mnemonics_processed_in_session
-            self.api_calls_total_since_last_rl_cycle = 0
-            self.api_errors_429_since_last_rl_cycle = 0
-            self.api_timeouts_since_last_rl_cycle = 0
-            self.last_rl_cycle_time = loop_start_time # Record time for next delta calculation
-
-            # Wait for the next cycle
-            # Adjust sleep time if the loop itself took significant time, though unlikely here
-            await asyncio.sleep(DQN_CYCLE_INTERVAL_SECONDS)
-
-        logging.info("DQN Rate Limiter control loop stopped.")
-        # Model saving is now handled in the main finally block of BalanceChecker.start()
-
-
-    # --- DQN Worker Count Methods ---
-    def _get_worker_count_state_wc(self) -> np.ndarray:
-        norm_worker_count = (self.current_num_processing_workers - MIN_PROCESSING_WORKERS) / \
-                            (MAX_PROCESSING_WORKERS - MIN_PROCESSING_WORKERS)
+    # --- PPO Worker Count Methods ---
+    def _get_worker_count_state_ppo(self) -> np.ndarray:
+        norm_worker_count = (len(self.processing_worker_tasks) - self.config.WC_MIN_PROCESSING_WORKERS) / \
+                            (self.config.WC_MAX_PROCESSING_WORKERS - self.config.WC_MIN_PROCESSING_WORKERS)
         norm_worker_count = np.clip(norm_worker_count, 0, 1)
 
-        queue_fill = self.async_mnemonic_queue.qsize() / self.async_mnemonic_queue.maxsize \
-            if self.async_mnemonic_queue.maxsize > 0 else 0.0
+        queue_fill = self.async_mnemonic_queue.qsize() / self.config.ASYNC_MNEMONIC_QUEUE_SIZE \
+            if self.config.ASYNC_MNEMONIC_QUEUE_SIZE > 0 else 0.0
 
-        # Placeholder for processing time per mnemonic or throughput per worker
-        # For now, using overall throughput as a rough guide.
-        # A more direct measure of worker efficiency would be better.
-        # Let's use queue_fill again as a simple third state for now.
-        # TODO: Improve this state feature with actual worker efficiency metric.
-        avg_proc_time_norm_placeholder = queue_fill # Re-using queue_fill as placeholder for 3rd state feature
+        # More advanced state: CPU load, actual processing time per item
+        # For now, using a placeholder like in DQN version or just two states.
+        # Let's use CPU load if psutil is available and configured
+        cpu_load = 0.0
+        if self.config.WC_INCLUDE_CPU_LOAD_STATE:
+            try:
+                import psutil # Lazy import for optional dependency
+                cpu_load = psutil.cpu_percent(interval=None) / 100.0 # Normalized
+            except ImportError:
+                logger.warning("psutil not installed, CPU load for WC agent state is disabled.")
+            except Exception as e:
+                logger.error(f"Error getting CPU load: {e}")
 
-        state = np.array([
-            norm_worker_count,
-            queue_fill,
-            avg_proc_time_norm_placeholder # Placeholder
-        ], dtype=np.float32)
-        return state
+        state_features = [norm_worker_count, queue_fill]
+        if self.config.WC_INCLUDE_CPU_LOAD_STATE:
+            state_features.append(cpu_load)
 
-    async def _apply_worker_count_action_wc(self, action: int):
-        previous_worker_count = self.current_num_processing_workers
+        # Ensure state matches WC_AGENT_STATE_SIZE from config
+        # This is a simple way, could be more dynamic if state features change often
+        if len(state_features) != self.config.WC_AGENT_STATE_SIZE:
+            logger.error(f"WC Agent state feature count mismatch: expected {self.config.WC_AGENT_STATE_SIZE}, got {len(state_features)}. Adjust config or state features.")
+            # Fallback to a fixed size state if error (e.g. pad with zeros or truncate)
+            # For now, this will likely cause PPO to fail if sizes don't match.
+            # Best to ensure config matches features defined here.
+
+        return np.array(state_features, dtype=np.float32)
+
+
+    async def _apply_worker_count_action_ppo(self, action: int):
+        previous_worker_count = len(self.processing_worker_tasks)
+        target_workers = previous_worker_count
 
         if action == 0: # Decrease workers
-            target_workers = max(MIN_PROCESSING_WORKERS, self.current_num_processing_workers - WORKER_ADJUSTMENT_STEP)
-        elif action == 1: # Maintain workers
-            target_workers = self.current_num_processing_workers
+            target_workers = max(self.config.WC_MIN_PROCESSING_WORKERS, previous_worker_count - self.config.WC_WORKER_ADJUSTMENT_STEP)
         elif action == 2: # Increase workers
-            target_workers = min(MAX_PROCESSING_WORKERS, self.current_num_processing_workers + WORKER_ADJUSTMENT_STEP)
-        else: # Should not happen
-            logging.warning(f"WC DQN: Unknown action {action}")
-            return
+            target_workers = min(self.config.WC_MAX_PROCESSING_WORKERS, previous_worker_count + self.config.WC_WORKER_ADJUSTMENT_STEP)
+        # action == 1 means maintain
 
-        tasks_to_add = target_workers - len(self.processing_worker_tasks)
+        tasks_to_add = target_workers - previous_worker_count
 
         if tasks_to_add > 0:
-            logging.info(f"WC DQN: Increasing workers by {tasks_to_add}. Current: {len(self.processing_worker_tasks)}, Target: {target_workers}")
+            logger.info(f"PPO WC: Increasing workers by {tasks_to_add}. Current: {previous_worker_count}, Target: {target_workers}")
             for _ in range(tasks_to_add):
-                if len(self.processing_worker_tasks) < MAX_PROCESSING_WORKERS: # Double check limit
+                if len(self.processing_worker_tasks) < self.config.WC_MAX_PROCESSING_WORKERS:
                     task = asyncio.create_task(self.process_queue())
                     self.processing_worker_tasks.append(task)
                 else:
-                    logging.warning("WC DQN: Max worker limit reached during increase.")
+                    logger.warning("PPO WC: Max worker limit reached during increase.")
                     break
-        elif tasks_to_add < 0: # Need to remove tasks
+        elif tasks_to_add < 0:
             num_to_remove = abs(tasks_to_add)
-            logging.info(f"WC DQN: Decreasing workers by {num_to_remove}. Current: {len(self.processing_worker_tasks)}, Target: {target_workers}")
+            logger.info(f"PPO WC: Decreasing workers by {num_to_remove}. Current: {previous_worker_count}, Target: {target_workers}")
             for _ in range(num_to_remove):
                 if self.processing_worker_tasks:
                     task_to_cancel = self.processing_worker_tasks.pop()
-                    if not task_to_cancel.done():
-                        task_to_cancel.cancel()
-                        # Optionally await cancellation with a timeout if critical
-                        # try:
-                        #     await asyncio.wait_for(task_to_cancel, timeout=1.0)
-                        # except asyncio.CancelledError:
-                        #     logging.debug("Worker task cancelled successfully by WC DQN.")
-                        # except asyncio.TimeoutError:
-                        #     logging.warning("Worker task did not respond to cancellation by WC DQN quickly.")
+                    if not task_to_cancel.done(): task_to_cancel.cancel()
                 else:
-                    logging.warning("WC DQN: Min worker limit reached during decrease or no tasks to remove.")
+                    logger.warning("PPO WC: Min worker limit reached or no tasks to remove.")
                     break
 
         self.current_num_processing_workers = len(self.processing_worker_tasks) # Update actual count
+        self.app_stats["active_processing_workers"] = self.current_num_processing_workers
         if self.current_num_processing_workers != previous_worker_count:
-             logging.info(f"WC DQN: Adjusted processing workers from {previous_worker_count} to {self.current_num_processing_workers}.")
+             logger.info(f"PPO WC: Adjusted processing workers from {previous_worker_count} to {self.current_num_processing_workers}.")
         else:
-             logging.info(f"WC DQN: Maintained processing workers at {self.current_num_processing_workers}.")
+             logger.info(f"PPO WC: Maintained processing workers at {self.current_num_processing_workers}.")
 
+    def _calculate_worker_count_reward_ppo(self, time_delta_seconds: float, previous_action: int) -> float:
+        processed_count_cycle = self.wc_agent_worker_count.get_and_reset_processed_count_cycle()
+        throughput = processed_count_cycle / time_delta_seconds if time_delta_seconds > 0 else 0.0
 
-    def _calculate_worker_count_reward_wc(self, time_delta_seconds: float) -> float:
-        mnemonics_in_cycle = self.mnemonics_processed_in_session - self.mnemonics_processed_last_wc_cycle
-        throughput = mnemonics_in_cycle / time_delta_seconds if time_delta_seconds > 0 else 0.0
+        reward = throughput * self.config.WC_REWARD_THROUGHPUT_SCALAR
 
-        reward = throughput * 0.1 # Basic reward for throughput
+        queue_fill = self.async_mnemonic_queue.qsize() / self.config.ASYNC_MNEMONIC_QUEUE_SIZE if self.config.ASYNC_MNEMONIC_QUEUE_SIZE > 0 else 0.0
 
-        queue_fill = self.async_mnemonic_queue.qsize() / self.async_mnemonic_queue.maxsize if self.async_mnemonic_queue.maxsize > 0 else 0
+        if queue_fill > self.config.WC_QUEUE_HIGH_THRESHOLD_PENALTY and previous_action == 0 : # Decreased workers when queue was full
+            reward += self.config.WC_PENALTY_QUEUE_HIGH_ON_DECREASE # Penalties are negative in config
+        elif queue_fill < self.config.WC_QUEUE_LOW_THRESHOLD_PENALTY and previous_action == 2: # Increased workers when queue was empty
+            reward += self.config.WC_PENALTY_QUEUE_LOW_ON_INCREASE
 
-        if queue_fill > 0.85 and self.wc_previous_action == 0 : # Penalize if decreased workers when queue was full
-            reward -= 2.0
-        elif queue_fill < 0.15 and self.wc_previous_action == 2: # Penalize if increased workers when queue was empty
-            reward -= 1.0
-        elif 0.2 <= queue_fill <= 0.8: # Bonus for keeping queue in healthy range
-            reward += 0.5
+        if self.config.WC_REWARD_QUEUE_OPTIMAL_RANGE_BONUS > 0 and \
+           self.config.WC_QUEUE_OPTIMAL_RANGE_LOW <= queue_fill <= self.config.WC_QUEUE_OPTIMAL_RANGE_HIGH:
+            reward += self.config.WC_REWARD_QUEUE_OPTIMAL_RANGE_BONUS
 
-        # Penalty for too many or too few workers relative to some ideal (hard to define without CPU load)
-        # For now, rely on queue fill and throughput.
+        # Optional: Penalty for high CPU load if workers were increased
+        if self.config.WC_PENALTY_HIGH_CPU_ON_INCREASE < 0 and previous_action == 2:
+            try:
+                import psutil
+                cpu_load = psutil.cpu_percent(interval=None)
+                if cpu_load > self.config.WC_CPU_HIGH_THRESHOLD_PENALTY:
+                    reward += self.config.WC_PENALTY_HIGH_CPU_ON_INCREASE
+            except Exception: pass # Ignore if psutil fails or not installed
 
-        logging.debug(f"WC Reward Calc: Throughput={throughput:.2f} (reward component: {throughput * 0.1:.2f}), "
-                     f"QueueFill={queue_fill:.2f}. Total Reward: {reward:.2f}")
+        logger.debug(f"PPO WC Reward: Throughput={throughput:.2f} (rew: {throughput * self.config.WC_REWARD_THROUGHPUT_SCALAR:.2f}), "
+                     f"QueueFill={queue_fill:.2f}. Total: {reward:.2f}")
         return float(reward)
 
-    async def _dqn_control_loop_worker_count(self):
-        logging.info("DQN Worker Count control loop started.")
-        await asyncio.sleep(DQN_WC_CYCLE_INTERVAL_SECONDS) # Initial delay
+    async def _ppo_control_loop_worker_count(self):
+        logger.info("PPO Worker Count control loop started.")
+        await asyncio.sleep(self.config.WC_CYCLE_INTERVAL_SECONDS)
+
+        last_cycle_time = time.time()
 
         while not self._stop_event.is_set():
+            await self._pause_event.wait() # Respect pause
             loop_start_time = time.time()
-            current_state = self._get_worker_count_state_wc()
+            try:
+                current_state = self._get_worker_count_state_ppo()
+                action, _ = self.wc_agent_worker_count.predict(current_state, deterministic=not self.config.PPO_TRAIN_MODE)
 
-            if self.wc_previous_state is not None and self.wc_previous_action is not None:
-                time_delta = loop_start_time - self.last_wc_cycle_time
-                reward = self._calculate_worker_count_reward_wc(time_delta)
+                await self._apply_worker_count_action_ppo(action)
 
-                await asyncio.get_running_loop().run_in_executor(
-                    self.executor, self.wc_agent_worker_count.step,
-                    self.wc_previous_state, self.wc_previous_action, reward, current_state, False)
-                logging.debug(f"WC DQN Agent learning step. Reward: {reward:.3f}, Epsilon: {self.wc_agent_worker_count.eps:.3f}")
+                # Wait for the cycle duration
+                await asyncio.sleep(self.config.WC_CYCLE_INTERVAL_SECONDS)
 
-            action = await asyncio.get_running_loop().run_in_executor(
-                self.executor, self.wc_agent_worker_count.get_action, current_state)
+                if self.config.PPO_TRAIN_MODE:
+                    time_delta = time.time() - loop_start_time # Actual time passed
+                    reward = self._calculate_worker_count_reward_ppo(time_delta, action)
+                    next_state = self._get_worker_count_state_ppo()
+                    done = self._stop_event.is_set()
 
-            await self._apply_worker_count_action_wc(action) # Apply action (might change self.processing_worker_tasks)
+                    self.wc_agent_worker_count.record_experience(current_state, action, reward, next_state, done)
+                    await asyncio.get_running_loop().run_in_executor(self.executor, self.wc_agent_worker_count.train_on_collected_rollout)
+            except Exception as e:
+                logger.error(f"Error in PPO Worker Count control loop: {e}", exc_info=True)
+                await asyncio.sleep(self.config.WC_CYCLE_INTERVAL_SECONDS) # Ensure wait on error
 
-            self.wc_previous_state = current_state
-            self.wc_previous_action = action
-            self.mnemonics_processed_last_wc_cycle = self.mnemonics_processed_in_session
-            self.last_wc_cycle_time = loop_start_time
+            last_cycle_time = time.time()
 
-            await asyncio.sleep(DQN_WC_CYCLE_INTERVAL_SECONDS)
-
-        logging.info("DQN Worker Count control loop stopped.")
-        # Model saving handled in main shutdown
+        logger.info("PPO Worker Count control loop stopped.")
 
 
     async def process_queue(self):
-        task_name = asyncio.current_task().get_name() if hasattr(asyncio.current_task(), 'get_name') else "ProcessQueueTask"
-        logging.info(f"Worker {task_name} starting.")
+        """Worker coroutine that processes mnemonics from the async_mnemonic_queue."""
+        task_name = getattr(asyncio.current_task(), 'get_name', lambda: "ProcessQueueTask")()
+        logger.info(f"Worker {task_name} starting.")
+
+        # Get local references to config values used frequently in loop
+        num_child_addrs = self.config.NUM_CHILD_ADDRESSES_TO_CHECK
+        bip44_account = self.config.BIP44_ACCOUNT
+        bip44_change_val = self.config.BIP44_CHANGE_TYPE.value # Get int value from enum
+        coins_to_process = self.coins_to_check # From config
+
         while not self._stop_event.is_set():
+            await self._pause_event.wait() # Respect pause
+            mnemonic = None # Ensure mnemonic is defined for logging in case of early exception
             try:
                 mnemonic = await asyncio.wait_for(self.async_mnemonic_queue.get(), timeout=1.0)
-                if mnemonic is None: # Sentinel for shutdown
-                    self.async_mnemonic_queue.put_nowait(None) # Put back for other workers
+                if mnemonic is None: # Sentinel for shutdown (though _stop_event should catch first)
+                    self.async_mnemonic_queue.task_done() # Mark as done if using queue joining
                     break
 
-                current_index = self.processed_mnemonic_index + 1 # Tentative index
+                # Tentative index for this mnemonic.
+                # This assumes mnemonics are processed roughly in order from the queue.
+                # For absolute correctness with out-of-order processing (if workers are very different speeds),
+                # the mnemonic itself would need to carry its original index from the generator.
+                # The current MnemonicGeneratorManager (from mnemonic_generator.py) does not add index to queue.
+                # So, this sequential indexing is the best effort.
+                current_processed_idx = self.processed_mnemonic_index + 1
 
-                addresses = await self.generate_addresses(mnemonic)
-                balances = {}
-                found_any_balance = False
-                for coin_type in self.coins:
-                    address = addresses.get(coin_type)
-                    if address:
-                        balance = await self.check_balance(address, coin_type)
-                        balances[str(coin_type)] = balance
-                        if balance > 0:
-                            found_any_balance = True
-                    else: # Should not happen if generate_addresses is correct
-                        balances[str(coin_type)] = 0.0
+                # 1. Generate addresses for all configured coins
+                # 1. Generate addresses for all configured coins using the imported function
+                # This is a CPU-bound task, run in executor
+                derived_addresses_by_coin = await asyncio.get_running_loop().run_in_executor(
+                    self.executor,
+                    generate_addresses_with_paths, # Imported from mnemonic_generator.py
+                    mnemonic, coins_to_process, num_child_addrs, bip44_account, bip44_change_val
+                )
 
-                await self.log_result(current_index, mnemonic, balances, found_any_balance)
+                all_address_details_for_log = []
+                found_any_balance_for_mnemonic = False
+                history_score = 0.0 # Default if classifier not used or fails
 
-                # Update processed index and counter
-                self.processed_mnemonic_index = current_index
+                # Optional: Score mnemonic with classifier before detailed checks
+                if self.config.ENABLE_CLASSIFIER_SCORING and self.classifier_history_model:
+                    try:
+                        mnemonic_features = await asyncio.get_running_loop().run_in_executor(
+                            self.executor, extract_mnemonic_features, mnemonic
+                        )
+                        # Model expects a 2D array
+                        score_proba = await asyncio.get_running_loop().run_in_executor(
+                             self.executor, self.classifier_history_model.predict_proba, [mnemonic_features]
+                        )
+                        history_score = score_proba[0][1] # Probability of the positive class (has history)
+                        # Optional: if score is too low, skip API calls for this mnemonic (config.CLASSIFIER_SKIP_THRESHOLD)
+                        if history_score < self.config.CLASSIFIER_SKIP_THRESHOLD:
+                            logger.debug(f"Skipping mnemonic {mnemonic[:15]} due to low history score: {history_score:.3f}")
+                            # Still need to log it as checked, but without balance/tx details
+                            # For now, continue processing to get full data, but this is where skip would go.
+                    except Exception as e:
+                        logger.error(f"Error during mnemonic classification: {e}", exc_info=True)
+
+
+                # 2. For each coin and its derived addresses, check balance and existence
+                for coin_type, child_addresses_info in derived_addresses_by_coin.items():
+                    coin_name_str = coin_type.name # For logging keys
+
+                    for child_addr_info in child_addresses_info:
+                        address_str = child_addr_info["address"]
+                        derivation_path = child_addr_info["path"]
+
+                        # Use APIHandler to get balance and existence
+                        # This is an I/O bound task
+                        balance, has_funds, has_history = await self.api_handler.get_balance_and_existence(
+                            coin_type, address_str
+                        )
+
+                        all_address_details_for_log.append({
+                            "coin": coin_name_str,
+                            "address": address_str,
+                            "path": derivation_path,
+                            "balance": balance,
+                            "has_funds": has_funds,
+                            "has_on_chain_history": has_history
+                        })
+
+                        if has_funds:
+                            found_any_balance_for_mnemonic = True
+                            # Log immediately to found.txt via main logger or specific method
+                            # This is handled by self.log_result if found_any_balance_for_mnemonic is true
+
+                # 3. Log the comprehensive result for the mnemonic
+                await self.log_result(
+                    current_processed_idx,
+                    mnemonic,
+                    all_address_details_for_log, # This is now a list of dicts
+                    found_any_balance_for_mnemonic,
+                    history_score if self.config.ENABLE_CLASSIFIER_SCORING else None
+                )
+
+                # 4. Update counters
+                self.processed_mnemonic_index = current_processed_idx
                 self.mnemonics_processed_in_session += 1
-                if self.mnemonics_processed_in_session % 100 == 0: # Log progress
-                    logging.info(f"Processed {self.mnemonics_processed_in_session} mnemonics this session. Current overall index: {self.processed_mnemonic_index}")
+                self.app_stats["mnemonics_checked_session"] = self.mnemonics_processed_in_session
+
+                # Update per-cycle counts for RL agents
+                if self.rl_agent_rate_limiter: self.rl_agent_rate_limiter.increment_processed_count()
+                if self.wc_agent_worker_count: self.wc_agent_worker_count.increment_processed_count()
+
+                if found_any_balance_for_mnemonic:
+                    self.found_wallets_count_session += 1
+                    self.app_stats["wallets_found_session"] = self.found_wallets_count_session
+                    # Update last_found_wallet_details for UI (simplified for now)
+                    self.app_stats["last_found_wallet_details"] = {
+                        "mnemonic": mnemonic,
+                        "details": all_address_details_for_log
+                    }
+
 
             except asyncio.TimeoutError: # Expected if queue is empty
                 continue
             except asyncio.CancelledError:
-                logging.info("process_queue task cancelled.")
+                logger.info(f"Worker {task_name} was cancelled.")
                 break
             except Exception as e:
-                # Log mnemonic if available, otherwise a placeholder
-                mnemonic_str = mnemonic if 'mnemonic' in locals() and isinstance(mnemonic, str) else "unknown_mnemonic"
-                logging.error(f"Error processing {mnemonic_str}: {str(e)}", exc_info=True)
+                mnemonic_str = mnemonic[:15] if mnemonic else "unknown_mnemonic"
+                logger.error(f"Error processing mnemonic {mnemonic_str}... : {e}", exc_info=True)
+                self.app_stats["errors_encountered"] +=1
             finally:
-                if 'mnemonic' in locals() and mnemonic is not None: # Check if mnemonic was successfully retrieved
+                if mnemonic is not None: # Check if mnemonic was successfully retrieved
                     self.async_mnemonic_queue.task_done()
-        logging.info(f"process_queue worker {asyncio.current_task().get_name()} stopping.")
+        logger.info(f"Worker {task_name} stopping.")
 
+    async def log_result(self, index: int, mnemonic: str, address_details_list: list, found_balance: bool, history_score: float = None):
+        """Logs the detailed result for a mnemonic, including all checked child addresses."""
+        log_payload = {
+            "index": index,
+            "timestamp": datetime.now().isoformat(),
+            "mnemonic": mnemonic,
+            "addresses": address_details_list # List of dicts, one per child address
+        }
+        if history_score is not None:
+            log_payload["history_score"] = round(history_score, 4)
 
-    async def generate_addresses(self, mnemonic: str):
-        """Generates addresses for supported coins from a mnemonic."""
-        loop = asyncio.get_running_loop()
-        try:
-            # bip_utils recommends using its own Bip39SeedGenerator for converting mnemonic to seed
-            # It also needs the language for the mnemonic. Assuming English.
-            seed_bytes = await loop.run_in_executor(
-                self.executor,
-                Bip39SeedGenerator(mnemonic, Bip39Languages.ENGLISH).Generate
-            )
+        log_message_json = json.dumps(log_payload)
 
-            addresses = {}
-            # Bitcoin (BTC) - BIP44 path m/44'/0'/0'/0/0
-            bip44_btc_acc = Bip44.FromSeed(seed_bytes, Bip44Coins.BITCOIN).Purpose().Coin().Account(0)
-            bip44_btc_addr = bip44_btc_acc.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0)
-            addresses[Bip44Coins.BITCOIN] = await loop.run_in_executor(self.executor, bip44_btc_addr.PublicKey().ToAddress)
-
-            # Ethereum (ETH) - BIP44 path m/44'/60'/0'/0/0
-            bip44_eth_acc = Bip44.FromSeed(seed_bytes, Bip44Coins.ETHEREUM).Purpose().Coin().Account(0)
-            bip44_eth_addr = bip44_eth_acc.Change(Bip44Changes.CHAIN_EXT).AddressIndex(0)
-            addresses[Bip44Coins.ETHEREUM] = await loop.run_in_executor(self.executor, bip44_eth_addr.PublicKey().ToAddress)
-
-            return addresses
-        except Exception as e:
-            logging.error(f"Address generation failed for mnemonic '{mnemonic[:15]}...': {str(e)}", exc_info=True)
-            return {}
-
-
-    async def check_balance(self, address: str, coin_type):
-        """
-        Checks balance for a given address and coin type using multiple API fallbacks.
-        Updates API endpoint statistics.
-        """
-        endpoint_url_templates = API_ENDPOINTS.get(coin_type, [])
-        if not endpoint_url_templates:
-            logging.warning(f"No API endpoints configured for coin type: {coin_type}")
-            return 0.0
-
-        # Create tasks for all configured endpoints for this coin_type
-        # Store url_template with the task to identify it later for stats update
-        tasks_with_ids = []
-        for url_template in endpoint_url_templates:
-            task = asyncio.create_task(
-                self.fetch_balance(url_template, coin_type, address),
-                name=f"fetch_{coin_type}_{url_template}" # Optional name for debugging
-            )
-            tasks_with_ids.append({"task": task, "url_template": url_template})
-
-        final_balance = 0.0
-        first_success_achieved = False
-
-        # Process tasks as they complete
-        for task_with_id in asyncio.as_completed([item["task"] for item in tasks_with_ids]):
-            # Find the original url_template associated with this completed task
-            # This is a bit clunky; could also pass url_template into fetch_balance's result tuple
-            completed_task_obj = None
-            url_template_for_task = None
-            for item in tasks_with_ids:
-                if item["task"] == task_with_id: # task_with_id is the coroutine result from as_completed
-                    completed_task_obj = item["task"]
-                    url_template_for_task = item["url_template"]
-                    break
-
-            if not completed_task_obj or not url_template_for_task:
-                logging.error("Could not map completed task to its URL template. Skipping stats update for this task.")
-                continue
-
-            try:
-                balance, success, is_timeout, is_429, latency_ms = await completed_task_obj
-
-                # Update stats for this specific endpoint
-                await self._update_specific_endpoint_stats(coin_type, url_template_for_task, success, is_timeout, is_429, latency_ms)
-
-                if success and balance > 0 and not first_success_achieved:
-                    final_balance = balance
-                    first_success_achieved = True
-                    # Don't break here; allow other tasks to complete for stats collection, but we have our primary result.
-                    # However, we should cancel remaining tasks if we are satisfied.
-                    # For now, let's let them all run to gather full stats, then refine.
-                    # This means we might make more API calls than strictly necessary if first one succeeds.
-            except Exception as e:
-                # This exception would be from awaiting the task itself, not from within fetch_balance's try/except
-                logging.error(f"Error processing task for {url_template_for_task}: {e}", exc_info=True)
-                # Still attempt to update stats as a failure
-                await self._update_specific_endpoint_stats(coin_type, url_template_for_task, False, False, False, 0)
-        
-        # Log API stats periodically (could also be a separate recurring task)
-        await self._log_api_endpoint_stats_periodically()
-
-        return final_balance
-
-
-    async def fetch_balance(self, url_template: str, coin_type, address: str):
-        """
-        Fetches balance from a single API endpoint.
-        Returns a tuple: (balance: float, success: bool, is_timeout: bool, is_429: bool, latency_ms: int)
-        url_template is used as the key for stats.
-        """
-        is_timeout_local = False
-        is_429_local = False
-        status_code_local = None
-        latency_ms = 0
-        url_formatted = url_template.format(address=address)
-
-        start_time = time.perf_counter()
-
-        try:
-            async with self.limiter: # Overall rate limiter
-                async with self.session.get(url_formatted, timeout=10) as resp:
-                    latency_ms = int((time.perf_counter() - start_time) * 1000)
-                    status_code_local = resp.status
-                    resp_text = await resp.text()
-
-                    if status_code_local == 429:
-                        is_429_local = True
-                        logging.debug(f"API 429 error for {address} at {url_formatted}")
-                        return 0.0, False, is_timeout_local, is_429_local, latency_ms
-
-                    if status_code_local != 200:
-                        logging.debug(f"API {url_formatted} returned status {status_code_local}. Response: {resp_text[:200]}")
-                        return 0.0, False, is_timeout_local, is_429_local, latency_ms
-                    
-                    try:
-                        data = json.loads(resp_text)
-                    except json.JSONDecodeError:
-                        logging.debug(f"Invalid JSON from {url_formatted}. Response: {resp_text[:200]}")
-                        return 0.0, False, is_timeout_local, is_429_local, latency_ms
-                    
-                    if 'error' in data or ('message' in data and isinstance(data.get('message'), str) and
-                                           "error" in data.get('message','').lower() and
-                                           not "rate limit" in data.get('message','').lower()):
-                        logging.debug(f"API error in payload for {address} at {url_formatted}: {data.get('error', data.get('message'))}")
-                        return 0.0, False, is_timeout_local, is_429_local, latency_ms
-                    
-                    balance = self.parse_balance(data, coin_type, url_formatted)
-                    return balance, True, is_timeout_local, is_429_local, latency_ms
-                    
-        except asyncio.TimeoutError:
-            latency_ms = int((time.perf_counter() - start_time) * 1000) # Capture latency up to timeout
-            logging.debug(f"API timeout for {address} at {url_formatted}")
-            is_timeout_local = True
-            return 0.0, False, is_timeout_local, is_429_local, latency_ms
-        except aiohttp.ClientError as e:
-            latency_ms = int((time.perf_counter() - start_time) * 1000)
-            logging.debug(f"API client error for {address} at {url_formatted}: {type(e).__name__} - {str(e)}")
-            if hasattr(e, 'status') and e.status:
-                status_code_local = e.status
-                if status_code_local == 429: is_429_local = True
-            return 0.0, False, is_timeout_local, is_429_local, latency_ms
-        except Exception as e:
-            latency_ms = int((time.perf_counter() - start_time) * 1000)
-            logging.warning(f"Unexpected API error for {address} at {url_formatted}: {type(e).__name__} - {str(e)}", exc_info=True)
-            return 0.0, False, is_timeout_local, is_429_local, latency_ms
-        finally:
-            # Update general RL stats (for rate limiter DQN)
-            await self._update_api_call_stats(status_code=status_code_local, is_timeout=is_timeout_local)
-            # Specific endpoint stats are updated in check_balance after all attempts for a coin.
-
-
-    def parse_balance(self, data, coin_type, url_for_context=""):
-        """Parses balance from API response data."""
-        try:
-            if coin_type == Bip44Coins.BITCOIN:
-                if 'final_balance' in data: # blockchain.info
-                    return float(data['final_balance']) / 1e8
-                # btc.com specific parsing (example, needs actual structure)
-                if isinstance(data.get('data'), dict) and 'balance' in data['data']:
-                    return float(data['data']['balance']) / 1e8
-                # Add more parsers for other Bitcoin APIs if needed
-                logging.debug(f"Unknown Bitcoin balance format from {url_for_context}: {str(data)[:200]}")
-                return 0.0
-                
-            elif coin_type == Bip44Coins.ETHEREUM:
-                result = data.get('result', '0')
-                if isinstance(result, str) and result.startswith('0x'): # Hex value
-                    return float(int(result, 16)) / 1e18
-                if isinstance(result, str) and result.isdigit(): # String decimal
-                    return float(result) / 1e18
-                if isinstance(result, (int, float)): # Already a number
-                     return float(result) / 1e18
-                logging.debug(f"Unknown Ethereum balance format or error in result from {url_for_context}: {result}")
-                return 0.0
-                
-            elif coin_type == "USDT": # ERC20 USDT on Ethereum
-                result = data.get('result', '0')
-                if isinstance(result, str) and result.isdigit():
-                    return float(result) / 1e6 # USDT has 6 decimal places typically
-                if isinstance(result, (int, float)):
-                     return float(result) / 1e6
-                logging.debug(f"Unknown USDT balance format or error in result from {url_for_context}: {result}")
-                return 0.0
-                
-        except (ValueError, TypeError, KeyError) as e:
-            logging.error(f"Parse error for {coin_type} from {url_for_context} with data {str(data)[:200]}: {e}", exc_info=True)
-        return 0.0
-
-    async def log_result(self, index: int, mnemonic: str, balances: dict, found_balance: bool):
-        """Logs the result using the dedicated results_logger."""
-        # Format: index|datetime|mnemonic|json_balances
-        log_message = f"{index}|{datetime.now().isoformat()}|{mnemonic}|{json.dumps(balances)}"
-        
-        loop = asyncio.get_running_loop()
-        # Run synchronous logging in executor to avoid blocking asyncio loop
-        await loop.run_in_executor(self.executor, results_logger.info, log_message)
+        # Log to checked.txt (which is now handled by logger_setup.py 'CheckedWalletsLogger')
+        # So, get that logger and use it.
+        checked_logger = logging.getLogger('CheckedWalletsLogger')
+        await asyncio.get_running_loop().run_in_executor(self.executor, checked_logger.info, log_message_json)
 
         if found_balance:
-            found_log_message = f"{index}|{datetime.now().isoformat()}|{mnemonic}|{json.dumps(balances)}\n"
-            try:
-                # found.txt can also be managed by a logger if complex rotation is needed
-                # For now, simple append. Ensure directory exists.
-                os.makedirs(os.path.dirname(self.found_file), exist_ok=True)
-                # Synchronous write to found.txt, executed in the ThreadPoolExecutor
-                await loop.run_in_executor(self.executor, self._write_to_found_file, found_log_message)
-            except Exception as e:
-                logging.error(f"Failed to write to found.txt: {e}")
+            found_logger = logging.getLogger('FoundWalletsLogger')
+            # For found.txt, we might want a slightly different or more concise format if it's human-readable
+            # For now, using the same JSON payload.
+            await asyncio.get_running_loop().run_in_executor(self.executor, found_logger.info, log_message_json)
 
-    def _write_to_found_file(self, content: str):
-        """Helper synchronous method to write content to the found_file."""
+        # Update WebSocket queue for UI
+        # Send a summary or the full payload depending on UI needs
+        # For now, let's send a summary if it's just for table update, or full if UI can handle it.
+        # Let's send a structured summary for the main table, and full details if a row is expanded.
+        # For now, just push the full payload to the websocket queue.
         try:
-            with open(self.found_file, "a") as f:
-                f.write(content)
+            # Create a distinct object for WebSocket to avoid issues if log_payload is modified
+            ws_payload = dict(log_payload)
+            ws_payload["type"] = "checked_wallet"
+            if found_balance:
+                ws_payload["type"] = "found_wallet" # UI can highlight this
+
+            self.websocket_message_queue.put_nowait(ws_payload)
+        except asyncio.QueueFull:
+            logger.warning("WebSocket message queue full. UI updates may be lagging.")
         except Exception as e:
-            logging.error(f"Synchronous write to {self.found_file} failed: {e}")
+            logger.error(f"Error putting message to WebSocket queue: {e}")
 
-async def main():
-    # Ensure necessary directories exist
-    os.makedirs("finder", exist_ok=True)
 
-    checker = BalanceChecker()
+    # --- Web Server Methods (aiohttp) ---
+    async def handle_websocket(self, request):
+        ws = aiohttp.web.WebSocketResponse()
+        await ws.prepare(request)
+        logger.info("WebSocket client connected.")
+        request.app['websockets'].add(ws) # Add to app's set of websockets
+
+        # Send current app status immediately on connection
+        try:
+            await ws.send_json({"type": "app_status", "data": self.app_stats})
+        except Exception as e:
+            logger.error(f"Error sending initial status to WebSocket: {e}")
+
+
+        try:
+            async for msg in ws: # Listen for messages from client (e.g., control commands)
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                        logger.info(f"WebSocket received command: {data}")
+                        if data.get("command") == "pause":
+                            self._pause_event.clear() # Pause processing
+                            self.app_stats["status"] = "Paused"
+                            logger.info("Processing paused via WebSocket.")
+                        elif data.get("command") == "resume":
+                            self._pause_event.set() # Resume processing
+                            self.app_stats["status"] = "Running"
+                            logger.info("Processing resumed via WebSocket.")
+                        elif data.get("command") == "stop":
+                            logger.info("Stop command received via WebSocket. Initiating shutdown.")
+                            self._stop_event.set()
+                            self._pause_event.set() # Ensure unpaused for shutdown
+                            # Further shutdown logic is handled by main start() loop's finally block
+                        # Send updated status back
+                        self.update_websocket_message_queue() # This will send app_status via broadcast
+                    except json.JSONDecodeError:
+                        logger.warning(f"WebSocket received invalid JSON: {msg.data}")
+                    except Exception as e:
+                        logger.error(f"Error processing WebSocket command: {e}", exc_info=True)
+
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.error(f"WebSocket connection closed with exception {ws.exception()}")
+        except Exception as e:
+            logger.error(f"Exception in WebSocket handler: {e}", exc_info=True)
+        finally:
+            logger.info("WebSocket client disconnected.")
+            request.app['websockets'].discard(ws)
+        return ws
+
+    async def get_status_http(self, request):
+        return aiohttp.web.json_response(self.app_stats)
+
+    async def handle_control_http(self, request):
+        try:
+            data = await request.json()
+            command = data.get("command")
+            logger.info(f"HTTP control command received: {command}")
+            if command == "pause":
+                self._pause_event.clear()
+                self.app_stats["status"] = "Paused"
+                return aiohttp.web.json_response({"status": "success", "message": "Processing paused."})
+            elif command == "resume":
+                self._pause_event.set()
+                self.app_stats["status"] = "Running"
+                return aiohttp.web.json_response({"status": "success", "message": "Processing resumed."})
+            elif command == "stop":
+                self._stop_event.set()
+                self._pause_event.set()
+                return aiohttp.web.json_response({"status": "success", "message": "Shutdown initiated."})
+            else:
+                return aiohttp.web.json_response({"status": "error", "message": "Unknown command."}, status=400)
+        except json.JSONDecodeError:
+            return aiohttp.web.json_response({"status": "error", "message": "Invalid JSON payload."}, status=400)
+        except Exception as e:
+            logger.error(f"Error in HTTP control handler: {e}", exc_info=True)
+            return aiohttp.web.json_response({"status": "error", "message": "Internal server error."}, status=500)
+
+
+    async def broadcast_to_websockets(self):
+        """Periodically sends updates from websocket_message_queue to all connected clients."""
+        while not self._stop_event.is_set():
+            try:
+                # Send app_stats periodically or on change (more efficient)
+                # For now, this loop focuses on messages from websocket_message_queue
+                message_to_send = await asyncio.wait_for(self.websocket_message_queue.get(), timeout=0.5)
+                if message_to_send:
+                    # Create a list of sockets to iterate over to avoid issues if set changes during iteration
+                    sockets_to_send_to = list(self.web_app['websockets'])
+                    for ws_client in sockets_to_send_to:
+                        if not ws_client.closed:
+                            try:
+                                await ws_client.send_json(message_to_send)
+                            except ConnectionResetError:
+                                logger.warning("WebSocket ConnectionResetError during broadcast. Client likely disconnected.")
+                                self.web_app['websockets'].discard(ws_client) # Remove if error
+                            except RuntimeError as e: # Eg "RuntimeError: Socket is closed"
+                                logger.warning(f"WebSocket RuntimeError during broadcast: {e}. Client likely disconnected.")
+                                self.web_app['websockets'].discard(ws_client)
+                            except Exception as e:
+                                logger.error(f"Error sending message to WebSocket client: {e}")
+                                self.web_app['websockets'].discard(ws_client) # Assume problematic
+                    self.websocket_message_queue.task_done()
+            except asyncio.TimeoutError: # Expected, means queue was empty
+                continue
+            except Exception as e:
+                logger.error(f"Error in WebSocket broadcast loop: {e}", exc_info=True)
+                await asyncio.sleep(1) # Avoid fast loop on persistent error
+
+    def update_websocket_message_queue(self):
+        """Puts the current app_stats onto the websocket_message_queue."""
+        try:
+            # Update dynamic stats before sending
+            self.app_stats["mnemonics_checked_session"] = self.mnemonics_processed_in_session
+            self.app_stats["wallets_found_session"] = self.found_wallets_count_session
+            self.app_stats["current_api_rate_limit"] = self.current_api_rate
+            self.app_stats["active_processing_workers"] = len(self.processing_worker_tasks)
+            self.app_stats["input_queue_size"] = self.mp_mnemonic_input_queue.qsize() if hasattr(self.mp_mnemonic_input_queue, 'qsize') else -1
+            self.app_stats["output_queue_size"] = self.async_mnemonic_queue.qsize()
+
+            time_elapsed_session = time.time() - self.session_start_time
+            if time_elapsed_session > 0 :
+                self.app_stats["mnemonics_per_second_session"] = round(self.mnemonics_processed_in_session / time_elapsed_session, 2)
+            else:
+                self.app_stats["mnemonics_per_second_session"] = 0
+
+            self.websocket_message_queue.put_nowait({"type": "app_status", "data": self.app_stats})
+        except asyncio.QueueFull:
+            logger.warning("WebSocket message queue full while trying to update app_status.")
+        except Exception as e:
+            logger.error(f"Error updating WebSocket queue with app_status: {e}")
+
+    async def _periodic_stats_updater(self):
+        """Periodically calls update_websocket_message_queue."""
+        while not self._stop_event.is_set():
+            await self._pause_event.wait() # Respect pause for this too
+            try:
+                self.update_websocket_message_queue()
+                # Also log API stats from APIHandler periodically if it's not doing it itself
+                if self.api_handler:
+                    await self.api_handler.log_api_endpoint_stats_periodically()
+
+            except Exception as e:
+                logger.error(f"Error in periodic_stats_updater: {e}", exc_info=True)
+
+            # Determine sleep duration based on configured interval (e.g., 1 second for UI updates)
+            await asyncio.sleep(self.config.APP_STATS_UI_UPDATE_INTERVAL_SECONDS)
+
+
+    async def run_web_server(self):
+        self.web_app = aiohttp.web.Application()
+        self.web_app['websockets'] = set() # Store active WebSocket connections
+
+        self.web_app.router.add_get('/ws', self.handle_websocket)
+        self.web_app.router.add_get('/status', self.get_status_http)
+        self.web_app.router.add_post('/control', self.handle_control_http)
+
+        # Configure CORS if origins are set
+        if self.config.CORS_ALLOWED_ORIGINS:
+            import aiohttp_cors
+            cors = aiohttp_cors.setup(self.web_app, defaults={
+                origin: aiohttp_cors.ResourceOptions(
+                    allow_credentials=True, expose_headers="*", allow_headers="*"
+                ) for origin in self.config.CORS_ALLOWED_ORIGINS
+            })
+            for route in list(self.web_app.router.routes()):
+                cors.add(route)
+
+        runner = aiohttp.web.AppRunner(self.web_app)
+        await runner.setup()
+        site = aiohttp.web.TCPSite(runner, self.config.WEB_SERVER_HOST, self.config.WEB_SERVER_PORT)
+
+        logger.info(f"Starting web server on http://{self.config.WEB_SERVER_HOST}:{self.config.WEB_SERVER_PORT}")
+        logger.info(f"WebSocket endpoint on ws://{self.config.WEB_SERVER_HOST}:{self.config.WEB_SERVER_PORT}/ws")
+
+        # Start the site and the broadcast loop concurrently
+        # The site itself runs until stop_event is set (or KeyboardInterrupt)
+        # We need a way to gracefully shut down the site runner.
+
+        # The broadcast_to_websockets task needs to be started and managed
+        broadcast_task = asyncio.create_task(self.broadcast_to_websockets())
+
+        try:
+            await site.start()
+            # Keep site running while stop_event is not set
+            while not self._stop_event.is_set():
+                await asyncio.sleep(1) # Check stop_event periodically
+        except KeyboardInterrupt: # Should be caught by main start loop
+            logger.info("Web server received KeyboardInterrupt.")
+        except Exception as e:
+            logger.error(f"Web server run error: {e}", exc_info=True)
+        finally:
+            logger.info("Shutting down web server...")
+            if not broadcast_task.done(): broadcast_task.cancel()
+            await runner.cleanup() # Gracefully stop the AppRunner
+            logger.info("Web server shut down.")
+
+
+async def main_entry_point(args): # Accept args
+    # Setup logging using the centralized logger_setup module
+    # This should be the ONLY place logging is configured initially.
+    logger_setup.setup_logging(config_obj=app_config) # Pass the config object
+
+    # Profiling (optional)
+    if args.profile_mem:
+        tracemalloc.start()
+        logger.info("Tracemalloc (memory profiling) started.")
+
+    if args.profile_cpu:
+        profiler = cProfile.Profile()
+        profiler.enable()
+        logger.info("cProfile (CPU profiling) started.")
+
+    # Initialize BalanceChecker with the loaded config
+    checker = BalanceChecker(cfg=app_config)
+
     try:
-        await checker.start()
+        await checker.start(args) # Pass args to BalanceChecker's start if needed
     except KeyboardInterrupt:
-        logging.info("Main: KeyboardInterrupt caught, initiating shutdown sequence.")
-        # The checker.start() finally block should handle graceful shutdown.
+        logger.info("Main entry: KeyboardInterrupt caught, application will shut down via BalanceChecker's finally block.")
     except Exception as e:
-        logging.critical(f"Main: Unhandled exception in BalanceChecker: {e}", exc_info=True)
+        logger.critical(f"Main entry: Unhandled exception: {e}", exc_info=True)
     finally:
-        logging.info("Main: Application shutdown complete.")
+        logger.info("Main entry: Application shutdown sequence initiated or completed.")
+        if args.profile_cpu and 'profiler' in locals():
+            profiler.disable()
+            s = io.StringIO()
+            sortby = pstats.SortKey.CUMULATIVE
+            ps = pstats.Stats(profiler, stream=s).sort_stats(sortby)
+            ps.print_stats(30) # Print top 30 cumulative time functions
+            logger.info("\n--- cProfile CPU Profile ---")
+            logger.info(s.getvalue())
+            logger.info("--- End cProfile CPU Profile ---")
+            profile_file = os.path.join(app_config.LOG_DIR, "app_cpu_profile.prof")
+            profiler.dump_stats(profile_file)
+            logger.info(f"CPU profile saved to {profile_file}")
+
+
+        if args.profile_mem:
+            snapshot = tracemalloc.take_snapshot()
+            top_stats = snapshot.statistics('lineno')
+            logger.info("\n--- Tracemalloc Memory Profile (Top 10) ---")
+            for stat in top_stats[:10]:
+                logger.info(str(stat))
+            logger.info("--- End Tracemalloc Memory Profile ---")
+
+            # Save snapshots periodically if needed (more complex)
+            # For now, just one at the end.
+            snapshot_dir = os.path.join(app_config.LOG_DIR, "memory_snapshots")
+            os.makedirs(snapshot_dir, exist_ok=True)
+            snapshot_file = os.path.join(snapshot_dir, f"mem_snapshot_{time.strftime('%Y%m%d-%H%M%S')}.snap")
+            snapshot.dump(snapshot_file)
+            logger.info(f"Memory snapshot saved to {snapshot_file}")
 
 
 if __name__ == "__main__":
-    # Important for multiprocessing on Windows and macOS with spawn/forkserver
     multiprocessing.freeze_support()
-    asyncio.run(main())
+
+    parser = argparse.ArgumentParser(description="Crypto Wallet Scanner Application")
+    parser.add_argument("--profile-cpu", action="store_true", help="Enable CPU profiling with cProfile.")
+    parser.add_argument("--profile-mem", action="store_true", help="Enable memory profiling with tracemalloc.")
+    # Add other command-line arguments as needed from config.py to allow overrides
+    # For example:
+    # parser.add_argument("--config-file", type=str, help="Path to a custom YAML/JSON config file.")
+    # parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Override log level.")
+
+    cli_args = parser.parse_args()
+
+    # TODO: Handle config overrides from CLI args if implementing that feature
+    # For now, app_config is loaded directly from finder.config
+
+    asyncio.run(main_entry_point(cli_args))
