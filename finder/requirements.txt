@@ -7,3 +7,8 @@ torch==2.2.1 # Or a version compatible with your environment
 # For CPU only, you can often use torch compiled for CPU to save space/download time.
 # e.g. torch==2.2.1+cpu (check availability for your OS/Python version on PyTorch website)
 PySide6==6.6.2 # Or latest stable version
+stable-baselines3>=2.0.0 # For PPO/A2C agents
+gymnasium>=0.28.1 # Dependency for stable-baselines3
+# protobuf==3.20.* # Often needed by SB3 or its dependencies, pinning if issues arise
+# huggingface-sb3 # If using SB3 model hub features (not planned for now)
+pytest>=7.0.0 # For running unit tests
