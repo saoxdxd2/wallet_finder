@@ -10,23 +10,30 @@ A cross-platform tool for generating and checking cryptocurrency wallet balances
   - Python-based multi-process BIP39 mnemonic generation using `multiprocessing`.
   - State preservation for mnemonic generation index.
 - 🧠 **AI-Enhanced Operation (Experimental)**
-  - Deep Q-Network (DQN) agent for dynamically adjusting API rate limits to optimize throughput and minimize errors.
-  - DQN agent for dynamically adjusting the number of concurrent wallet processing workers based on system load and queue status.
-  - Heuristic-based performance tracking for API endpoints.
-- 🔍 **Blockchain Scanning**
-  - Supports Bitcoin, Ethereum, and USDT.
+  - **PPO (Proximal Policy Optimization) Agents:** Both API rate limits and the number of concurrent wallet processing workers are now dynamically adjusted by PPO agents for potentially more stable and efficient learning. (Replaced DQNs).
+  - Heuristic-based performance tracking for individual API endpoints (scores logged).
+  - (Experimental) Initial framework for ML classification of mnemonics/addresses based on on-chain history (includes feature extraction and model training scripts in `analysis/`).
+- 📡 **Advanced Wallet Processing**
+  - **Child Address Derivation:** Checks multiple derived child addresses (e.g., first 10) per mnemonic for each supported coin, significantly increasing coverage.
+- 🔍 **Expanded Blockchain Scanning**
+  - Supports **Bitcoin (BTC), Ethereum (ETH), USDT (ERC20), Litecoin (LTC), and Dogecoin (DOGE)**.
+  - Each address checked for both balance and on-chain transaction history (existence).
   - Multiple API endpoint fallbacks with performance tracking.
-  - DQN-controlled request throttling.
-- 📊 **Real-Time GUI Monitoring**
-  - Live updates of checked wallets (via `finder/app2.py`).
-  - Balance statistics and history
-  - Automatic log rotation
-  - Cross-platform support (Windows/Linux)
-
+  - AI-controlled request throttling.
+- 🖥️ **Modernized GUI (PySide6 Foundation with React UI Conceptualized)**
+  - Backend API (`finder/app.py`) now includes a WebSocket and HTTP server to stream data to a modern UI.
+  - The primary GUI (`finder/app2.py`) is now built on PySide6, providing a native desktop experience.
+  - Conceptual React components (`frontend/src/`) provided as a template for a potential future web-based UI, capable of displaying detailed child address info, logs, and stats, with basic pause/resume controls.
+  - Ethical use disclaimer prompt at GUI startup.
+- 🛡️ **Robustness & Security (Basic)**
+  - Optional proxy support (SOCKS5/HTTP) for API requests, configurable in `finder/config.py`.
+- 📊 **Real-Time GUI Monitoring** (via PySide6 GUI or future React UI)
+  - Live updates of checked wallets, including details for multiple child addresses.
+  - Display of operational statistics.
+  - Log viewing.
 - 🔒 **Safety Features**
-  - No external server communication
-  - Local storage only
-  - Clean shutdown handling
+  - Local data storage for models, logs, and state.
+  - Clean shutdown handling for backend processes.
 
 ## Installation
 
@@ -93,18 +100,19 @@ Storage	100 MB (more if DQN models become large or many logs are kept)
 CPU	Multi-core CPU recommended
 
 ## Dependencies
-Python Packages:
-  - `PySide6` (for the graphical user interface)
-  - `torch` (PyTorch for DQN agents)
-  - `aiohttp` (for asynchronous HTTP requests)
-  - `aiolimiter` (for rate limiting async operations)
-  - `bip-utils` (for BIP39 mnemonic and BIP44 address derivation)
-  - `mnemonic` (for BIP39 mnemonic generation)
-  - (See `finder/requirements.txt` for specific versions and other minor dependencies)
+Key Python Packages (see `finder/requirements.txt` for full list and versions):
+  - `PySide6`: For the native desktop GUI.
+  - `torch`: Core deep learning framework (used by PPO agents).
+  - `stable-baselines3`: For PPO reinforcement learning agents.
+  - `gymnasium`: Dependency for `stable-baselines3`.
+  - `aiohttp`: For asynchronous HTTP requests (API calls, WebSocket server).
+  - `aiolimiter`: For rate limiting asynchronous operations.
+  - `bip-utils`: For BIP39 mnemonic and BIP44 address derivation.
+  - `mnemonic`: For BIP39 mnemonic generation.
+  - `pandas`, `joblib`, `scikit-learn`: Used by offline analysis and ML model training scripts.
 
-To install Python dependencies manually (if not using installer scripts):
+To install Python dependencies (ideally in a virtual environment):
 ```bash
-# (Activate your virtual environment first if using one)
 pip install -r finder/requirements.txt
 ```
 

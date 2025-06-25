@@ -21,27 +21,39 @@ API_ENDPOINTS = {
     ],
     "USDT": [
         "https://api.etherscan.io/api?module=account&action=tokenbalance&contractaddress=0xdac17f958d2ee523a2206206994597c13d831ec7&address={address}&tag=latest",
+    ],
+    Bip44Coins.LITECOIN: [
+        "https://api.blockchair.com/litecoin/dashboards/address/{address}",
+    ],
+    Bip44Coins.DOGECOIN: [
+        "https://api.blockchair.com/dogecoin/dashboards/address/{address}", # Provides balance and tx_count
+        # Add other DOGE balance endpoints if available (e.g., SoChain)
+        # "https://sochain.com/api/v2/get_address_balance/DOGE/{address}" # Alternative
     ]
 }
 
 # API Endpoints specifically for checking address transaction history/existence
 EXISTENCE_CHECK_API_ENDPOINTS = {
     Bip44Coins.BITCOIN: [
-        "https://blockchain.info/rawaddr/{address}", # Provides 'n_tx'
-        # Consider adding a Blockchair alternative if blockchain.info is unreliable for n_tx
-        # "https://api.blockchair.com/bitcoin/dashboards/address/{address}" # Provides address.transaction_count
+        "https://blockchain.info/rawaddr/{address}",
+        "https://api.blockchair.com/bitcoin/dashboards/address/{address}",
     ],
     Bip44Coins.ETHEREUM: [
-        # Get first transaction to check existence. Using offset=1 is efficient.
-        # Note: Add your Etherscan API key for reliable use.
         "https://api.etherscan.io/api?module=account&action=txlist&address={address}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey=YourApiKeyToken",
     ],
-    "USDT": [ # For ERC20 USDT, existence is tied to the Ethereum address having transactions.
+    "USDT": [
         "https://api.etherscan.io/api?module=account&action=txlist&address={address}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey=YourApiKeyToken",
+    ],
+    Bip44Coins.LITECOIN: [
+        "https://api.blockchair.com/litecoin/dashboards/address/{address}",
+    ],
+    Bip44Coins.DOGECOIN: [
+        "https://api.blockchair.com/dogecoin/dashboards/address/{address}", # Provides address.transaction_count
+        # "https://sochain.com/api/v2/address/DOGE/{address}" # Alternative, provides total_txs
     ]
 }
-# Placeholder for API Keys - In a real app, manage these securely (e.g., env variables, config file not in git)
-ETHERSCAN_API_KEY = "YourApiKeyToken" # Replace with your actual Etherscan API key
+ETHERSCAN_API_KEY = "YourApiKeyToken"
+# BLOCKCHAIR_API_KEY = "YourBlockchairApiKey" # Optional: Blockchair also supports API keys for higher limits
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 API_CALL_TIMEOUT = 10
@@ -96,6 +108,12 @@ GUI_MAX_TREE_ITEMS = 300 # Max items in checked wallets tree view
 
 # --- Seeds ---
 SEED_RL_AGENT = 42
+
+# --- Proxy Configuration ---
+ENABLE_PROXY = False  # Set to True to use a proxy for all API requests
+# Example for TOR SOCKS proxy: "socks5h://127.0.0.1:9050" (socks5h for DNS resolution via proxy)
+# Example for HTTP/HTTPS proxy: "http://user:pass@host:port" or "https://user:pass@host:port"
+PROXY_URL = ""
 SEED_WC_AGENT = 123
 
 # --- ML Model Integration ---
