@@ -24,7 +24,8 @@ import argparse # For command-line arguments
 import finder.config as config
 import finder.logger_setup as logger_setup
 from finder.mnemonic_generator import MnemonicGeneratorManager, save_current_index as save_generator_index, load_initial_index as load_generator_index
-from finder.dqn_agent import DQNAgent
+from finder.dqn_agent import DQNAgent # Will be replaced for PPO where applicable
+from finder.ppo_sb3_agent import PPOAgentSB3 # Import the new PPO agent
 from finder.api_handler import APIHandler
 
 
