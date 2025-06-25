@@ -18,9 +18,10 @@ import cProfile # For performance profiling
 import pstats # For processing cProfile stats
 import io # For capturing cProfile output to string
 import argparse # For command-line arguments
+import sys # For sys.exit in case of critical errors if main_entry_point handles them
 
 # Modular imports
-import config as app_config
+# import config as app_config # Config will be passed as an argument to main_entry_point
 import logger_setup # For main_entry_point call
 from mnemonic_generator import (
     MnemonicGeneratorManager,
@@ -92,11 +93,10 @@ class BalanceChecker:
         # Multiprocessing queue for receiving mnemonics from workers
         self.mp_mnemonic_input_queue = multiprocessing.Queue(maxsize=self.config.MP_MNEMONIC_QUEUE_SIZE)
         self.mnemonic_generator_manager = MnemonicGeneratorManager( # Manager from mnemonic_generator.py
-            config=self.config,
-            num_workers=self.config.MNEMONIC_GENERATOR_WORKERS,
-            # load_state=True here means MnemonicGeneratorManager loads its *raw* generation index.
-            # BalanceChecker loads its *processed* index separately.
-            load_state=True
+            config=self.config, # Pass the application config object
+            # num_workers is derived from config inside MnemonicGeneratorManager if not specified or <=0
+            # num_workers=self.config.MNEMONIC_GENERATOR_WORKERS,
+            load_state=False # MnemonicGeneratorManager itself is stateless regarding index; app.py manages processed index.
         )
         self._stop_event = asyncio.Event()
         self._pause_event = asyncio.Event() # For pause/resume functionality
@@ -142,19 +142,19 @@ class BalanceChecker:
         self.found_wallets_count_session = 0
 
 
-    async def _mp_to_asyncio_queue_adapter(self):
+    async def _mp_to_asyncio_queue_adapter(self): # Removed mp_queue argument, uses self.mp_mnemonic_input_queue
         logger.info("Starting multiprocessing to asyncio queue adapter.")
         loop = asyncio.get_running_loop()
-        temp_mnemonic_list = [] # Buffer for batch put
+        # temp_mnemonic_list = [] # Buffer for batch put - not currently used with single get
         while not self._stop_event.is_set():
             await self._pause_event.wait() # Respect pause signal
             try:
-                # Batch get from mp.Queue if possible, or single get
-                # For simplicity, using single get with timeout in executor
-                mnemonic_data = await loop.run_in_executor(self.executor, self.mp_queue.get, True, 0.1) # Timeout 0.1s
-                if mnemonic_data: # Expecting (index, mnemonic_phrase) from new generator
-                    # The new MnemonicGeneratorManager from mnemonic_generator.py puts (index, phrase)
-                    # but the one in this app.py was modified to put just phrase.
+                # Batch get from mp.Queue if possible, or single get.
+                # Using single get with timeout in executor.
+                # Target queue is self.mp_mnemonic_input_queue
+                mnemonic_data = await loop.run_in_executor(self.executor, self.mp_mnemonic_input_queue.get, True, 0.1) # Timeout 0.1s
+                if mnemonic_data:
+                    # MnemonicGeneratorManager's worker puts only the phrase.
                     # Let's assume the external one puts (index, phrase) and we use the phrase.
                     # If it's just phrase, then current_index logic in process_queue needs care.
                     # For now, assuming mnemonic_data is just the phrase as per current MnemonicGeneratorManager in app.py.
@@ -242,10 +242,10 @@ class BalanceChecker:
         # This seems cleaner. APIHandler's internal limiter becomes unused if one is passed.
 
         # Start the MnemonicGeneratorManager (from finder.mnemonic_generator.py)
-        # It manages its own raw generation index. We pass it the queue it should use.
+        # Pass the multiprocessing queue it should use.
         self.mnemonic_generator_manager.start_generation(output_queue=self.mp_mnemonic_input_queue)
 
-        adapter_task = asyncio.create_task(self._mp_to_asyncio_queue_adapter(self.mp_mnemonic_input_queue))
+        adapter_task = asyncio.create_task(self._mp_to_asyncio_queue_adapter()) # No argument needed now
 
         # Initialize processing workers (coroutines)
         self.processing_worker_tasks = []
@@ -408,27 +408,43 @@ class BalanceChecker:
             await self._pause_event.wait() # Respect pause
             loop_start_time = time.time()
             try:
+                # At the start of the agent's decision cycle, reset its internal per-cycle counters
+                self.rl_agent_rate_limiter.reset_cycle_stats()
+
                 current_state = self._get_rate_limiter_state_ppo()
-                action, _states = self.rl_agent_rate_limiter.predict(current_state, deterministic=not self.config.PPO_TRAIN_MODE)
+                # PPOAgentSB3.predict returns action as numpy array, e.g. array([1]), so extract scalar.
+                action_array, _states = self.rl_agent_rate_limiter.predict(current_state, deterministic=not self.config.PPO_TRAIN_MODE)
+                action = action_array.item() if isinstance(action_array, np.ndarray) else action_array
+
 
                 self._apply_rate_limiter_action_ppo(action)
 
                 # Wait for the cycle duration to collect experience
                 # This sleep should ideally be adjusted if the above steps take significant time
                 # For now, fixed sleep assuming agent steps are fast.
-                await asyncio.sleep(self.config.RL_CYCLE_INTERVAL_SECONDS) # Target cycle interval
+                # Ensure this sleep happens *after* action application and *before* reward calculation for this cycle.
+                await asyncio.sleep(self.config.RL_CYCLE_INTERVAL_SECONDS) # Target cycle interval for experience gathering
 
                 if self.config.PPO_TRAIN_MODE:
-                    time_delta = time.time() - loop_start_time # Actual time passed in cycle
-                    reward = self._calculate_rate_limiter_reward_ppo(time_delta, action)
-                    next_state = self._get_rate_limiter_state_ppo()
-                    done = self._stop_event.is_set()
+                    time_delta = time.time() - loop_start_time # Actual time passed in cycle, including the sleep
+                    reward = self._calculate_rate_limiter_reward_ppo(time_delta, action) # Uses agent's get_and_reset_... methods
+                    next_state = self._get_rate_limiter_state_ppo() # State after the cycle
+                    done_for_ppo = self._stop_event.is_set() # Episode ends if app is stopping
 
-                    self.rl_agent_rate_limiter.record_experience(current_state, action, reward, next_state, done)
-                    await asyncio.get_running_loop().run_in_executor(self.executor, self.rl_agent_rate_limiter.train_on_collected_rollout)
+                    self.rl_agent_rate_limiter.record_experience(current_state, action, reward, next_state, done_for_ppo)
+
+                    # Training happens if buffer is full. Agent handles this internally.
+                    # The train_on_collected_rollout needs the *final* observation for value estimation if not done.
+                    await asyncio.get_running_loop().run_in_executor(
+                        self.executor,
+                        self.rl_agent_rate_limiter.train_on_collected_rollout,
+                        next_state, # Pass the last observation of the rollout
+                        done_for_ppo   # Pass the done status of the last observation
+                    )
             except Exception as e:
                 logger.error(f"Error in PPO Rate Limiter control loop: {e}", exc_info=True)
                 # Optional: Implement a cooldown or skip a cycle on error to prevent rapid error loops
+                # Ensure we still wait to avoid busy-looping on error
                 await asyncio.sleep(self.config.RL_CYCLE_INTERVAL_SECONDS) # Ensure we still wait out the cycle
 
             last_cycle_time = time.time()
@@ -551,22 +567,33 @@ class BalanceChecker:
             await self._pause_event.wait() # Respect pause
             loop_start_time = time.time()
             try:
+                # At the start of the agent's decision cycle, reset its internal per-cycle counters
+                self.wc_agent_worker_count.reset_cycle_stats()
+
                 current_state = self._get_worker_count_state_ppo()
-                action, _ = self.wc_agent_worker_count.predict(current_state, deterministic=not self.config.PPO_TRAIN_MODE)
+                action_array, _ = self.wc_agent_worker_count.predict(current_state, deterministic=not self.config.PPO_TRAIN_MODE)
+                action = action_array.item() if isinstance(action_array, np.ndarray) else action_array
+
 
                 await self._apply_worker_count_action_ppo(action)
 
-                # Wait for the cycle duration
+                # Wait for the cycle duration to collect experience
                 await asyncio.sleep(self.config.WC_CYCLE_INTERVAL_SECONDS)
 
                 if self.config.PPO_TRAIN_MODE:
-                    time_delta = time.time() - loop_start_time # Actual time passed
-                    reward = self._calculate_worker_count_reward_ppo(time_delta, action)
-                    next_state = self._get_worker_count_state_ppo()
-                    done = self._stop_event.is_set()
+                    time_delta = time.time() - loop_start_time # Actual time passed in cycle
+                    reward = self._calculate_worker_count_reward_ppo(time_delta, action) # Uses agent's get_and_reset_...
+                    next_state = self._get_worker_count_state_ppo() # State after the cycle
+                    done_for_ppo = self._stop_event.is_set() # Episode ends if app is stopping
 
-                    self.wc_agent_worker_count.record_experience(current_state, action, reward, next_state, done)
-                    await asyncio.get_running_loop().run_in_executor(self.executor, self.wc_agent_worker_count.train_on_collected_rollout)
+                    self.wc_agent_worker_count.record_experience(current_state, action, reward, next_state, done_for_ppo)
+
+                    await asyncio.get_running_loop().run_in_executor(
+                        self.executor,
+                        self.wc_agent_worker_count.train_on_collected_rollout,
+                        next_state, # Pass the last observation of the rollout
+                        done_for_ppo   # Pass the done status of the last observation
+                    )
             except Exception as e:
                 logger.error(f"Error in PPO Worker Count control loop: {e}", exc_info=True)
                 await asyncio.sleep(self.config.WC_CYCLE_INTERVAL_SECONDS) # Ensure wait on error
@@ -603,10 +630,16 @@ class BalanceChecker:
                 current_task_object = Task(mnemonic_phrase=mnemonic_phrase, index=current_processed_idx)
 
                 # 1. Generate addresses for all configured coins
+                # generate_addresses_with_paths now also needs mnemonic_language_str
                 derived_addresses_by_coin_enum = await asyncio.get_running_loop().run_in_executor(
                     self.executor,
-                    generate_addresses_with_paths,
-                    current_task_object.mnemonic_phrase, coins_to_process, num_child_addrs, bip44_account, bip44_change_val
+                    generate_addresses_with_paths, # from mnemonic_generator.py
+                    current_task_object.mnemonic_phrase,
+                    coins_to_process, # list of Bip44Coins enums
+                    num_child_addrs,  # int
+                    bip44_account,    # int (account index)
+                    Bip44Changes(bip44_change_val), # Bip44Changes enum (external/internal)
+                    self.config.MNEMONIC_LANGUAGE # string, e.g., "english"
                 )
                 current_task_object.set_derived_addresses(derived_addresses_by_coin_enum)
 
@@ -954,12 +987,27 @@ class BalanceChecker:
             logger.info("Web server shut down.")
 
 
-async def main_entry_point(args): # Accept args
-    # Setup logging using the centralized logger_setup module
-    # This should be the ONLY place logging is configured initially.
-    logger_setup.setup_logging(config_obj=app_config) # Pass the config object
+async def main_entry_point(args: argparse.Namespace, app_config_obj): # Accept args and app_config_obj
+    """
+    Main asynchronous entry point for the application logic.
+    Called by run_scanner.py.
+    """
+    # Setup logging using the centralized logger_setup module.
+    # This should be the ONLY place logging is configured initially within the app logic.
+    # Pass the already loaded config object.
+    try:
+        logger_setup.setup_logging(config_obj=app_config_obj)
+    except Exception as e:
+        # If logging setup itself fails, we might be in trouble.
+        # Try a basic print and then attempt to log to a fallback before exiting.
+        print(f"CRITICAL: Failed to setup logging: {e}", file=sys.stderr)
+        logging.basicConfig(level=logging.ERROR) # Fallback basic config
+        logging.getLogger(__name__).critical(f"Failed to setup application logging: {e}", exc_info=True)
+        # Depending on severity, might exit or try to continue with basic logging.
+        # For now, let's assume it's critical enough to stop if primary logging fails.
+        # sys.exit("Application cannot start due to logging configuration failure.") # Or raise
 
-    # Profiling (optional)
+    # Profiling (optional, controlled by args from run_scanner.py)
     if args.profile_mem:
         tracemalloc.start()
         logger.info("Tracemalloc (memory profiling) started.")
@@ -969,62 +1017,51 @@ async def main_entry_point(args): # Accept args
         profiler.enable()
         logger.info("cProfile (CPU profiling) started.")
 
-    # Initialize BalanceChecker with the loaded config
-    checker = BalanceChecker(cfg=app_config)
+    # Initialize BalanceChecker with the passed config object
+    checker = BalanceChecker(cfg=app_config_obj)
 
     try:
-        await checker.start(args) # Pass args to BalanceChecker's start if needed
+        await checker.start(args) # Pass CLI args to BalanceChecker's start method
     except KeyboardInterrupt:
-        logger.info("Main entry: KeyboardInterrupt caught, application will shut down via BalanceChecker's finally block.")
+        # This will likely be caught by the BalanceChecker's main loop,
+        # but good to have a catch here too for robustness.
+        logging.getLogger(__name__).info("Main entry: KeyboardInterrupt caught. Application shutdown sequence should be handled by BalanceChecker.")
     except Exception as e:
-        logger.critical(f"Main entry: Unhandled exception: {e}", exc_info=True)
+        logging.getLogger(__name__).critical(f"Main entry: Unhandled exception: {e}", exc_info=True)
     finally:
-        logger.info("Main entry: Application shutdown sequence initiated or completed.")
+        logging.getLogger(__name__).info("Main entry: Application shutdown sequence initiated or completed.")
         if args.profile_cpu and 'profiler' in locals():
             profiler.disable()
             s = io.StringIO()
-            sortby = pstats.SortKey.CUMULATIVE
+            sortby = pstats.SortKey.CUMULATIVE # type: ignore # pstats.SortKey might not be recognized by linter
             ps = pstats.Stats(profiler, stream=s).sort_stats(sortby)
             ps.print_stats(30) # Print top 30 cumulative time functions
-            logger.info("\n--- cProfile CPU Profile ---")
-            logger.info(s.getvalue())
-            logger.info("--- End cProfile CPU Profile ---")
-            profile_file = os.path.join(app_config.LOG_DIR, "app_cpu_profile.prof")
+            logging.getLogger(__name__).info("\n--- cProfile CPU Profile ---")
+            logging.getLogger(__name__).info(s.getvalue())
+            logging.getLogger(__name__).info("--- End cProfile CPU Profile ---")
+            # Use LOG_DIR from the passed config object
+            profile_file = os.path.join(app_config_obj.LOG_DIR, "app_cpu_profile.prof")
             profiler.dump_stats(profile_file)
-            logger.info(f"CPU profile saved to {profile_file}")
+            logging.getLogger(__name__).info(f"CPU profile saved to {profile_file}")
 
 
         if args.profile_mem:
             snapshot = tracemalloc.take_snapshot()
             top_stats = snapshot.statistics('lineno')
-            logger.info("\n--- Tracemalloc Memory Profile (Top 10) ---")
+            logging.getLogger(__name__).info("\n--- Tracemalloc Memory Profile (Top 10) ---")
             for stat in top_stats[:10]:
-                logger.info(str(stat))
-            logger.info("--- End Tracemalloc Memory Profile ---")
+                logging.getLogger(__name__).info(str(stat))
+            logging.getLogger(__name__).info("--- End Tracemalloc Memory Profile ---")
 
             # Save snapshots periodically if needed (more complex)
             # For now, just one at the end.
-            snapshot_dir = os.path.join(app_config.LOG_DIR, "memory_snapshots")
+            # Use LOG_DIR from the passed config object
+            snapshot_dir = os.path.join(app_config_obj.LOG_DIR, "memory_snapshots")
             os.makedirs(snapshot_dir, exist_ok=True)
             snapshot_file = os.path.join(snapshot_dir, f"mem_snapshot_{time.strftime('%Y%m%d-%H%M%S')}.snap")
             snapshot.dump(snapshot_file)
-            logger.info(f"Memory snapshot saved to {snapshot_file}")
+            logging.getLogger(__name__).info(f"Memory snapshot saved to {snapshot_file}")
 
 
-if __name__ == "__main__":
-    multiprocessing.freeze_support()
-
-    parser = argparse.ArgumentParser(description="Crypto Wallet Scanner Application")
-    parser.add_argument("--profile-cpu", action="store_true", help="Enable CPU profiling with cProfile.")
-    parser.add_argument("--profile-mem", action="store_true", help="Enable memory profiling with tracemalloc.")
-    # Add other command-line arguments as needed from config.py to allow overrides
-    # For example:
-    # parser.add_argument("--config-file", type=str, help="Path to a custom YAML/JSON config file.")
-    # parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Override log level.")
-
-    cli_args = parser.parse_args()
-
-    # TODO: Handle config overrides from CLI args if implementing that feature
-    # For now, app_config is loaded directly from finder.config
-
-    asyncio.run(main_entry_point(cli_args))
+# The if __name__ == "__main__": block has been removed from app.py.
+# Its logic is now in run_scanner.py.

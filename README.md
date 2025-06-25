@@ -123,71 +123,92 @@ pip install -r finder/requirements.txt
 *   **If running from source manually:**
     1.  Activate your Python virtual environment.
     2.  Navigate to the project root directory.
-    3.  Run `python finder/app2.py`.
+    3.  Run `python run_scanner.py`.
 
-The application GUI (`finder/app2.py`) launches the backend logic (`finder/app.py`) as a separate process.
-DQN models for rate limiting and worker count adjustment are stored in `finder/models/` relative to where `finder/app.py` is executed. Logs and state files are also typically stored in the `finder` directory.
+The backend logic is primarily in `finder/app.py`, orchestrated by `run_scanner.py`.
+PPO models for API rate limiting and processing worker count adjustment are stored in `finder/models/`.
+Logs and state files are stored in `finder/logs/` (e.g., `app_main.log`, `checked_wallets.jsonl`, `found_wallets.jsonl`, PPO agent logs).
 
-## Main GUI Features
+## Main Features (Recap)
 
-        Real-time generation statistics
+- Real-time generation and checking statistics (via WebSocket to UI).
+- Dynamic API rate and worker adjustment using PPO agents.
+- Detailed logging of checked and found wallets in JSONL format.
+- Auto-rotating log files.
+- Support for multiple cryptocurrencies with balance and transaction history checks.
+- Child address derivation.
+- Optional mnemonic classification scoring.
 
-        Balance history timeline
+## Files Overview
 
-        Exportable results
+- `run_scanner.py`: Main entry point for the application.
+- `finder/app.py`: Core application logic: PPO agent control, balance checking, task management, WebSocket server.
+- `finder/config.py`: Centralized configuration for all application parameters, including paths, API endpoints, PPO hyperparameters, and logging settings.
+- `finder/logger_setup.py`: Module for configuring application-wide logging.
+- `finder/api_handler.py`: Handles all external API interactions for balance/history checks, including endpoint scoring and fallbacks.
+- `finder/mnemonic_generator.py`: Python-based multi-process BIP39 mnemonic phrase generator and address derivation logic.
+- `finder/ppo_sb3_agent.py`: Implements the PPO agent using Stable Baselines3.
+- `finder/features.py`: Feature extraction logic for mnemonic classification.
+- `finder/task.py`: Defines the `Task` data structure for managing mnemonic processing.
+- `finder/requirements.txt`: Python package dependencies.
+- `finder/models/`: Directory where trained PPO models are saved/loaded.
+- `finder/logs/`: Directory where all log files and state files are stored.
+    - `app_main.log`: General application logs.
+    - `checked_wallets.jsonl`: Log of all scanned wallets.
+    - `found_wallets.jsonl`: Log of wallets with balance/history.
+    - `debug_rl_agent.log`: Debug logs for PPO agents.
+    - `mnemonic_generator_raw_state.txt`: State for raw mnemonic generation index (if used).
+    - `application_processed_mnemonic_state.txt`: State for the application's processed mnemonic index.
 
-        Auto-rotating log files
+## Directory Structure
 
-    Files Overview
-        finder/app.py             # Main application engine: balance checking, DQN agent control.
-        finder/app2.py            # GUI interface (starts app.py).
-        finder/mnemonic_generator.py # Python-based mnemonic phrase generator.
-        finder/dqn_agent.py       # Core DQN Agent class implementation.
-        finder/models/            # Directory where trained DQN models are saved.
-        finder/generator_state.txt # State file for the mnemonic generator (tracks index).
-        finder/checked.txt        # Log of all scanned wallets and their balances (auto-rotates).
-        finder/found.txt          # Log of wallets found with a positive balance.
-        finder/requirements.txt   # Python package dependencies.
-
-Directory Structure
-Copy
-
-crypto-finder/
+```
+crypto-wallet-scanner/
+├── run_scanner.py             # Main application entry point
 ├── finder/
-│   ├── app.py                     # Main application logic (checker, DQN control)
-│   ├── app2.py                    # GUI interface
-│   ├── mnemonic_generator.py      # Mnemonic generation logic
-│   ├── dqn_agent.py               # DQN agent class
-│   ├── requirements.txt           # Python dependencies
-│   ├── generator_state.txt        # Mnemonic generator state
-│   ├── checked.txt                # Log of checked wallets (rotates)
-│   ├── found.txt                  # Log of wallets with balance
-│   └── models/                    # Stores trained DQN models
-│       ├── rate_limiter_agent_local.pth
-│       └── worker_count_agent_local.pth
+│   ├── app.py                 # Main application logic (PPO control, checking engine)
+│   ├── config.py              # Centralized configuration
+│   ├── logger_setup.py        # Logging setup
+│   ├── api_handler.py         # API interaction handler
+│   ├── mnemonic_generator.py  # Mnemonic generation & address derivation
+│   ├── ppo_sb3_agent.py       # PPO agent class (Stable Baselines3)
+│   ├── features.py            # Mnemonic feature extraction
+│   ├── task.py                # Task data structure
+│   ├── requirements.txt       # Python dependencies
+│   ├── models/                # Stores trained PPO models (e.g., *.zip files)
+│   │   └── *.zip
+│   └── logs/                  # Stores all logs and state files
+│       ├── app_main.log
+│       ├── checked_wallets.jsonl
+│       ├── found_wallets.jsonl
+│       ├── debug_rl_agent.log
+│       ├── *.txt              # State files
+│       └── ...
 │
-├── install.bat                # Main installer script (may need updates)
-├── install_linux.sh           # Linux installer (may need updates for Python-only env)
-└── README.md
+├── README.md                  # This file
+├── install.bat                # Example Windows installer (may need updates)
+├── CryptoWalletScanner.spec   # Example PyInstaller spec file (may need updates)
+└── ...                        # Other project files (e.g., .gitignore, frontend/)
+```
 
 Configuration
 
-- **API Endpoints**: Can be adjusted in `finder/app.py` within the `API_ENDPOINTS` dictionary.
-- **DQN Parameters**: Hyperparameters for the DQN agents (e.g., learning rate, buffer size, network architecture) are defined in `finder/dqn_agent.py` and `finder/app.py` (for state/action sizes, cycle intervals). These may require tuning for optimal performance. Model checkpoints are saved in `finder/models/`.
-- **Mnemonic Generator State**: The `finder/generator_state.txt` file stores the last processed mnemonic index, allowing generation to resume. Deleting this file will restart generation from the beginning.
-- **Logging**: Application logs, including DQN decisions and API statistics, are output to standard output and can be observed via the GUI's log panel. Wallet check results are in `finder/checked.txt`.
+- **All major configurations are now centralized in `finder/config.py`**. This includes:
+    - Paths for logs, models, and state files.
+    - API endpoint URLs, keys (placeholders), and parsing hints.
+    - PPO agent hyperparameters (learning rates, network sizes, cycle intervals, reward parameters, etc.).
+    - Mnemonic generation settings (strength, language, worker counts).
+    - Application performance settings (queue sizes, thread pool sizes).
+    - Logging levels and log rotation settings.
+- **PPO Agent Models**: Trained models are saved in `finder/models/` (e.g., `rate_limiter_ppo_agent.zip`). Deleting these will cause agents to start training from scratch.
+- **State Files**:
+    - `finder/logs/application_processed_mnemonic_state.txt`: Stores the index of the last mnemonic processed by the application, allowing resumption.
+    - `finder/logs/mnemonic_generator_raw_state.txt`: (If used by specific generator features) stores raw generation index.
+- **Logging**: All logs are now managed by `finder/logger_setup.py` and stored in `finder/logs/`.
+    - `app_main.log` contains general application status, PPO decisions, and errors.
+    - `checked_wallets.jsonl` and `found_wallets.jsonl` store detailed records of wallet checks.
 
-Adjust API endpoints in app.py:
-python
-Copy
-
-API_ENDPOINTS = {
-    Bip44Coins.BITCOIN: [
-        "https://blockchain.info/balance?active={address}",
-        # Add custom endpoints here
-    ],
-    # ... other coin configurations
-}
+Adjust API endpoints and other parameters directly in `finder/config.py`.
 
 Legal Disclaimer
 
