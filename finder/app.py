@@ -20,18 +20,18 @@ import io # For capturing cProfile output to string
 import argparse # For command-line arguments
 
 # Modular imports
-import finder.config as app_config
-import finder.logger_setup # For main_entry_point call
-from finder.mnemonic_generator import (
+import config as app_config
+import logger_setup # For main_entry_point call
+from mnemonic_generator import (
     MnemonicGeneratorManager,
     generate_addresses_with_paths, # Use this for address derivation
     load_generator_index_from_file, # For loading processed index state
     save_generator_index_to_file    # For saving processed index state
 )
-from finder.ppo_sb3_agent import PPOAgentSB3
-from finder.api_handler import APIHandler
-from finder.features import extract_mnemonic_features # extract_address_features is not used yet
-from finder.task import Task # Import the Task class
+from ppo_sb3_agent import PPOAgentSB3
+from api_handler import APIHandler
+from features import extract_mnemonic_features # extract_address_features is not used yet
+from task import Task # Import the Task class
 
 
 # Configure a logger for this module
